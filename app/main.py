@@ -11,7 +11,7 @@ app = FastAPI(title="Buscador Ferretería – Directo Daterium")
 def health():
     return {"status": "ok"}
 
-def to_dict(x: Any) -> Dict[str, Any]:
+def as_dict(x: Any) -> Dict[str, Any]:
     return x if isinstance(x, dict) else {}
 
 def first_or_none(x: Any):
@@ -20,20 +20,23 @@ def first_or_none(x: Any):
 
 @app.get("/buscar")
 def buscar(q: str = Query(..., min_length=3)):
+    # llamada directa
     try:
-        resp = httpx.get(DATERIUM_URL, params={"userID": DATERIUM_USERID, "searchbox": q}, timeout=30)
-        resp.raise_for_status()
+        r = httpx.get(DATERIUM_URL, params={"userID": DATERIUM_USERID, "searchbox": q}, timeout=30)
+        r.raise_for_status()
     except Exception as e:
         return {"error": f"HTTP error: {e}"}
 
+    # parseo XML robusto
     try:
-        data = xmltodict.parse(resp.text)
+        data = xmltodict.parse(r.text)
     except Exception as e:
-        return {"error": f"XML parse error: {e}", "raw_len": len(resp.text)}
+        return {"error": f"XML parse error: {e}"}
 
-    # Soporta posibles variantes: resultados/fichas/ficha o resultados/ficha
-    resultados = data.get("resultados") or data.get("resultado") or {}
-    fichas = resultados.get("ficha") or resultados.get("fichas") or []
+    # rutas posibles: buscador>resultados>ficha  |  resultados>ficha  |  resultados>fichas>ficha
+    root = data.get("buscador") or data
+    resultados = as_dict(root.get("resultados"))
+    fichas = resultados.get("ficha") or as_dict(resultados.get("fichas")).get("ficha") or []
     if isinstance(fichas, dict):
         fichas = [fichas]
     if not isinstance(fichas, list):
@@ -41,22 +44,33 @@ def buscar(q: str = Query(..., min_length=3)):
 
     productos: List[Dict[str, Any]] = []
     for f in fichas:
-        f = to_dict(f)
+        f = as_dict(f)
 
-        # referencias puede ser dict, list o string
+        # ID del producto (texto del nodo <id>)
+        prod_id = f.get("id")
+        if isinstance(prod_id, dict):
+            # cuando viene como {'@cont': '0', '#text': '1571488'}
+            prod_id = prod_id.get("#text") or prod_id.get("@value") or ""
+
+        # referencias (si existen)
         referencias = f.get("referencias")
-        referencia = None
+        ref = None
         if isinstance(referencias, dict):
-            referencia = referencias.get("referencia")
+            ref = referencias.get("referencia")
         elif isinstance(referencias, list):
-            referencia = referencias[0]
-        referencia = first_or_none(referencia)
-        ref = to_dict(referencia)
+            ref = referencias[0]
+        ref = first_or_none(ref)
+        ref = as_dict(ref)
 
-        # campos imagen con fallback
-        img = f.get("img280x240") or f.get("img500x500") or f.get("img") or ""
+        # imagen: prioriza thumb, luego tamaños conocidos
+        img = f.get("thumb") or f.get("img280x240") or f.get("img500x500") or f.get("img") or ""
 
-        # pvp y ean robustos
+        # marca puede venir como texto o dict con atributos
+        marca = f.get("marca")
+        if isinstance(marca, dict):
+            marca = marca.get("#text") or ""
+
+        # pvp y ean desde la referencia si existe
         try:
             pvp = float(ref.get("pvp", 0)) if ref else 0.0
         except Exception:
@@ -64,9 +78,10 @@ def buscar(q: str = Query(..., min_length=3)):
         ean = ref.get("ean") if ref else ""
 
         productos.append({
-            "nombre": f.get("nombre", "") or "",
-            "descripcion": f.get("descripcion", "") or "",
-            "marca": f.get("marca", "") or "",
+            "id": (prod_id or "").strip(),
+            "nombre": (f.get("nombre") or "").strip(),
+            "descripcion": (f.get("descripcion") or "").strip(),
+            "marca": (marca or "").strip(),
             "img": img or "",
             "ean": ean or "",
             "pvp": pvp,
@@ -74,10 +89,10 @@ def buscar(q: str = Query(..., min_length=3)):
 
     return {"productos": productos}
 
-# Endpoint opcional para ver la respuesta cruda (útil para debug puntual)
+# Debug opcional
 @app.get("/debug_raw")
 def debug_raw(q: str = Query(..., min_length=3), key: str = ""):
-    if key != "ok":  # protección simple
+    if key != "ok":
         return {"error": "unauthorized"}
     r = httpx.get(DATERIUM_URL, params={"userID": DATERIUM_USERID, "searchbox": q}, timeout=30)
-    return {"status_code": r.status_code, "len": len(r.text), "sample": r.text[:1000]}
+    return {"status_code": r.status_code, "len": len(r.text), "sample": r.text[:1200]}
