@@ -18,22 +18,29 @@ def first_or_none(x: Any):
     if isinstance(x, list): return x[0] if x else None
     return x
 
+def matches_all_terms(text: str, terms: list[str]) -> bool:
+    t = (text or "").lower()
+    return all(term in t for term in terms)
+
 @app.get("/buscar")
-def buscar(q: str = Query(..., min_length=3)):
-    # llamada directa
+def buscar(
+    q: str = Query(..., min_length=3, description="Texto de búsqueda"),
+    limit: int = Query(12, ge=1, le=30, description="Máximo de resultados")
+):
+    # 1) Llamada a Daterium
     try:
         r = httpx.get(DATERIUM_URL, params={"userID": DATERIUM_USERID, "searchbox": q}, timeout=30)
         r.raise_for_status()
     except Exception as e:
         return {"error": f"HTTP error: {e}"}
 
-    # parseo XML robusto
+    # 2) Parseo XML
     try:
         data = xmltodict.parse(r.text)
     except Exception as e:
         return {"error": f"XML parse error: {e}"}
 
-    # rutas posibles: buscador>resultados>ficha  |  resultados>ficha  |  resultados>fichas>ficha
+    # 3) Extraer fichas reales
     root = data.get("buscador") or data
     resultados = as_dict(root.get("resultados"))
     fichas = resultados.get("ficha") or as_dict(resultados.get("fichas")).get("ficha") or []
@@ -42,17 +49,17 @@ def buscar(q: str = Query(..., min_length=3)):
     if not isinstance(fichas, list):
         return {"productos": []}
 
+    # 4) Convertir y filtrar por términos (para recortar respuesta)
+    terms = [t.strip().lower() for t in q.split() if t.strip()]
     productos: List[Dict[str, Any]] = []
+
     for f in fichas:
         f = as_dict(f)
 
-        # ID del producto (texto del nodo <id>)
         prod_id = f.get("id")
         if isinstance(prod_id, dict):
-            # cuando viene como {'@cont': '0', '#text': '1571488'}
             prod_id = prod_id.get("#text") or prod_id.get("@value") or ""
 
-        # referencias (si existen)
         referencias = f.get("referencias")
         ref = None
         if isinstance(referencias, dict):
@@ -62,37 +69,36 @@ def buscar(q: str = Query(..., min_length=3)):
         ref = first_or_none(ref)
         ref = as_dict(ref)
 
-        # imagen: prioriza thumb, luego tamaños conocidos
         img = f.get("thumb") or f.get("img280x240") or f.get("img500x500") or f.get("img") or ""
-
-        # marca puede venir como texto o dict con atributos
         marca = f.get("marca")
         if isinstance(marca, dict):
             marca = marca.get("#text") or ""
 
-        # pvp y ean desde la referencia si existe
         try:
             pvp = float(ref.get("pvp", 0)) if ref else 0.0
         except Exception:
             pvp = 0.0
         ean = ref.get("ean") if ref else ""
 
+        nombre = (f.get("nombre") or "").strip()
+        descripcion = (f.get("descripcion") or "").strip()
+
+        # Filtrado por términos para acotar (nombre+descripcion+marca)
+        blob = " ".join([nombre, descripcion, marca or ""])
+        if terms and not matches_all_terms(blob, terms):
+            continue
+
         productos.append({
             "id": (prod_id or "").strip(),
-            "nombre": (f.get("nombre") or "").strip(),
-            "descripcion": (f.get("descripcion") or "").strip(),
+            "nombre": nombre,
+            "descripcion": descripcion,
             "marca": (marca or "").strip(),
             "img": img or "",
             "ean": ean or "",
             "pvp": pvp,
         })
 
-    return {"productos": productos}
+        if len(productos) >= limit:  # corte duro
+            break
 
-# Debug opcional
-@app.get("/debug_raw")
-def debug_raw(q: str = Query(..., min_length=3), key: str = ""):
-    if key != "ok":
-        return {"error": "unauthorized"}
-    r = httpx.get(DATERIUM_URL, params={"userID": DATERIUM_USERID, "searchbox": q}, timeout=30)
-    return {"status_code": r.status_code, "len": len(r.text), "sample": r.text[:1200]}
+    return {"productos": productos}
