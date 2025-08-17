@@ -1,104 +1,138 @@
-from fastapi import FastAPI, Query
-from typing import Any, Dict, List
-import httpx, xmltodict
+# -*- coding: utf-8 -*-
+from __future__ import annotations
 
-DATERIUM_USERID = "0662759feb731be6fd95c59c4bad9f5209286336"
-DATERIUM_URL = "https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php"
+import json
+import logging
+import os
+from typing import List, Optional
 
-app = FastAPI(title="Buscador Ferretería – Directo Daterium")
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
-@app.get("/health")
+from app.search import search_products, get_product_by_id
+
+# -----------------------------------------------------------
+# Configuración básica
+# -----------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
+logger = logging.getLogger("compra-inteligente")
+
+# Orígenes CORS (coma-separados). Ej: "https://konkabeza.com,https://chat.openai.com"
+_allowed = os.getenv("ALLOWED_ORIGINS", "https://konkabeza.com").strip()
+ALLOWED_ORIGINS: List[str] = [o.strip() for o in _allowed.split(",") if o.strip()]
+
+app = FastAPI(
+    title="Compra Inteligente – Backend",
+    version="1.0.0",
+    description="API de búsqueda y fichas (con Daterium) para WordPress y GPT.",
+)
+
+# CORS (docs: FastAPI CORSMiddleware)
+# https://fastapi.tiangolo.com/tutorial/cors/
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# -----------------------------------------------------------
+# Healthcheck y raíz
+# -----------------------------------------------------------
+@app.get("/health", tags=["infra"])
 def health():
-    return {"status": "ok"}
+    """
+    Endpoint simple para healthcheck de Railway / balanceadores.
+    """
+    return {"ok": True}
 
-def as_dict(x: Any) -> Dict[str, Any]:
-    return x if isinstance(x, dict) else {}
+@app.get("/", tags=["infra"])
+def root():
+    return {
+        "name": "Compra Inteligente – Backend",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "endpoints": ["/buscar", "/ficha", "/health"],
+    }
 
-def first_or_none(x: Any):
-    if isinstance(x, list): return x[0] if x else None
-    return x
-
-def matches_all_terms(text: str, terms: list[str]) -> bool:
-    t = (text or "").lower()
-    return all(term in t for term in terms)
-
-@app.get("/buscar")
+# -----------------------------------------------------------
+# BÚSQUEDA
+# -----------------------------------------------------------
+@app.get("/buscar", tags=["productos"])
 def buscar(
-    q: str = Query(..., min_length=3, description="Texto de búsqueda"),
-    limit: int = Query(12, ge=1, le=30, description="Máximo de resultados")
+    q: str = Query(..., min_length=2, description="Texto de búsqueda (nombre, marca, ref, EAN)"),
+    limit: int = Query(30, ge=1, le=100, description="Límite de resultados (1-100)"),
 ):
-    # 1) Llamada a Daterium
+    """
+    Devuelve una lista normalizada de productos.
+
+    Usa `search_products()` que:
+    - Descarga XML de Daterium **en streaming** (httpx.iter_bytes)
+    - Parsea incrementalmente con lxml (libera memoria)
+    - Cachea (Redis si REDIS_URL; si no, TTL en memoria)
+    """
     try:
-        r = httpx.get(DATERIUM_URL, params={"userID": DATERIUM_USERID, "searchbox": q}, timeout=30)
-        r.raise_for_status()
-    except Exception as e:
-        return {"error": f"HTTP error: {e}"}
+        productos = search_products(q, limit=limit)
+        # Si quieres, agrega aquí la url_ficha "canónica" para WP:
+        for p in productos:
+            pid = str(p.get("id") or "").strip()
+            if pid:
+                p["url_ficha"] = f"https://konkabeza.com/ferretero/producto/{pid}/"
+        return {"productos": productos}
+    except Exception as ex:
+        logger.exception("Error en /buscar: %s", ex)
+        raise HTTPException(status_code=502, detail="Error al consultar proveedor")
 
-    # 2) Parseo XML
+# -----------------------------------------------------------
+# FICHA
+# -----------------------------------------------------------
+@app.get("/ficha", tags=["productos"])
+def ficha(
+    id: str = Query(..., description="ID de Daterium (o EAN, se intenta coincidir)"),
+):
+    """
+    Devuelve la ficha de un producto por ID (o EAN).
+    Estrategia:
+      - Busca en Daterium por ese identificador
+      - Si hay coincidencia exacta por `id` o contiene el `ean`, la devuelve
+      - Si no, devuelve el primer resultado (fallback), o 404 si vacío
+    """
     try:
-        data = xmltodict.parse(r.text)
-    except Exception as e:
-        return {"error": f"XML parse error: {e}"}
+        prod = get_product_by_id(id)
+        if not prod:
+            raise HTTPException(status_code=404, detail="Producto no encontrado")
+        # Complementos útiles para la ficha en WP
+        pid = str(prod.get("id") or "").strip()
+        nombre = str(prod.get("nombre") or "").strip()
+        ean = str(prod.get("ean") or "").strip()
+        # Búsqueda Google (por EAN si hay, si no por nombre)
+        query_google = ean if ean else nombre
+        if query_google:
+            prod["google_url"] = f"https://www.google.com/search?q={query_google.replace(' ', '+')}"
+        prod["url_ficha_wp"] = f"https://konkabeza.com/ferretero/producto/{pid}/" if pid else None
+        return prod
+    except HTTPException:
+        raise
+    except Exception as ex:
+        logger.exception("Error en /ficha: %s", ex)
+        raise HTTPException(status_code=502, detail="Error al consultar proveedor")
 
-    # 3) Extraer fichas reales
-    root = data.get("buscador") or data
-    resultados = as_dict(root.get("resultados"))
-    fichas = resultados.get("ficha") or as_dict(resultados.get("fichas")).get("ficha") or []
-    if isinstance(fichas, dict):
-        fichas = [fichas]
-    if not isinstance(fichas, list):
-        return {"productos": []}
-
-    # 4) Convertir y filtrar por términos (para recortar respuesta)
-    terms = [t.strip().lower() for t in q.split() if t.strip()]
-    productos: List[Dict[str, Any]] = []
-
-    for f in fichas:
-        f = as_dict(f)
-
-        prod_id = f.get("id")
-        if isinstance(prod_id, dict):
-            prod_id = prod_id.get("#text") or prod_id.get("@value") or ""
-
-        referencias = f.get("referencias")
-        ref = None
-        if isinstance(referencias, dict):
-            ref = referencias.get("referencia")
-        elif isinstance(referencias, list):
-            ref = referencias[0]
-        ref = first_or_none(ref)
-        ref = as_dict(ref)
-
-        img = f.get("thumb") or f.get("img280x240") or f.get("img500x500") or f.get("img") or ""
-        marca = f.get("marca")
-        if isinstance(marca, dict):
-            marca = marca.get("#text") or ""
-
-        try:
-            pvp = float(ref.get("pvp", 0)) if ref else 0.0
-        except Exception:
-            pvp = 0.0
-        ean = ref.get("ean") if ref else ""
-
-        nombre = (f.get("nombre") or "").strip()
-        descripcion = (f.get("descripcion") or "").strip()
-
-        # Filtrado por términos para acotar (nombre+descripcion+marca)
-        blob = " ".join([nombre, descripcion, marca or ""])
-        if terms and not matches_all_terms(blob, terms):
-            continue
-
-        productos.append({
-            "id": (prod_id or "").strip(),
-            "nombre": nombre,
-            "descripcion": descripcion,
-            "marca": (marca or "").strip(),
-            "img": img or "",
-            "ean": ean or "",
-            "pvp": pvp,
-        })
-
-        if len(productos) >= limit:  # corte duro
-            break
-
-    return {"productos": productos}
+# -----------------------------------------------------------
+# NOTAS DE DESPLIEGUE (Railway / Uvicorn)
+# -----------------------------------------------------------
+# Start command recomendado (Railway):
+#   uvicorn app.main:app --host 0.0.0.0 --port $PORT
+#
+# Docs:
+# - CORS en FastAPI y añadir middlewares con add_middleware()  → https://fastapi.tiangolo.com/tutorial/cors/
+# - Ejecutar con Uvicorn / despliegue manual                   → https://fastapi.tiangolo.com/deployment/manually/
+# - Middlewares en FastAPI (referencia)                         → https://fastapi.tiangolo.com/reference/middleware/
+#
+# httpx streaming (usado en app/search.py):
+# - Quickstart / stream, iter_bytes()                           → https://www.python-httpx.org/quickstart/
+# - API .iter_bytes()                                           → https://www.python-httpx.org/api/
