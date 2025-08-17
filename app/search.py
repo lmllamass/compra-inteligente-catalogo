@@ -1,24 +1,26 @@
-from sqlalchemy import text
-from sqlalchemy.orm import Session
-from .settings import settings
+# app/search.py
+import httpx
+from typing import Iterable
 
-# Búsqueda simple por trigram en nombre y descripción
-# Requiere la migración 0001 para pg_trgm y los índices
+TIMEOUT = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)  # ajusta si hace falta
+HEADERS = {
+    "User-Agent": "CompraInteligenteBot/1.0",
+    "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+}
 
-def buscar_productos(session: Session, q: str, limit: int = 25):
-    schema = settings.DB_SCHEMA
-    query = text(
-        f"""
-        SELECT p.id_daterium, p.nombre, p.marca_id, p.familia_id, p.subfamilia_id, p.descripcion
-        FROM {schema}.productos p
-        WHERE (
-            p.nombre ILIKE :like
-            OR (p.descripcion IS NOT NULL AND p.descripcion ILIKE :like)
-        )
-        ORDER BY similarity(p.nombre, :q) DESC
-        LIMIT :limit
-        """
-    )
-    like = f"%{q}%"
-    rows = session.execute(query, {"q": q, "like": like, "limit": limit}).mappings().all()
-    return [dict(r) for r in rows]
+def fetch_xml_stream(url: str) -> Iterable[bytes]:
+    with httpx.Client(timeout=TIMEOUT, headers=HEADERS) as client:
+        # reintentos simples: 1 intento + 2 reintentos en errores de conexión/timeout
+        for attempt in range(3):
+            try:
+                with client.stream("GET", url) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_bytes():
+                        if chunk:
+                            yield chunk
+                    return
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
+                if attempt == 2:
+                    raise
+                continue
