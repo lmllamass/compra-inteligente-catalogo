@@ -6,3 +6,6 @@ httpx
 python-dotenv
 pydantic
 xmltodict
+httpx>=0.27.0
+lxml>=4.9.0
+redis>=5.0.0
