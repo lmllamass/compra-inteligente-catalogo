@@ -1,98 +1,47 @@
 # etl/full_seed.py
 from __future__ import annotations
-import os, asyncio, math, random
-from typing import List, Optional, Tuple, Iterable
+import os, asyncio, time, random, sys, json
+from typing import Optional, Iterable
+
 import psycopg
 import httpx
-import time
 from lxml import etree
 from urllib.parse import quote
-# --- al inicio del archivo, junto a imports ---
-import json, sys
 
+# ================== CONFIG ==================
+DATERIUM_USER_ID = os.getenv("DATERIUM_USER_ID", "").strip()
+# Usamos DATABASE_URL y, si es interno (.internal) y estás fuera de Railway, permite usar DATABASE_PUBLIC_URL.
+def _effective_dsn() -> str:
+    dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL") or ""
+    if (".internal" in dsn or "railway.internal" in dsn) and os.getenv("DATABASE_PUBLIC_URL"):
+        return os.getenv("DATABASE_PUBLIC_URL")
+    return dsn
+
+MAX_CONCURRENCY = int(os.getenv("SEED_CONCURRENCY", "5"))
+RATE_DELAY      = float(os.getenv("SEED_RATE_DELAY", "0.4"))
+BATCH_COMMIT    = int(os.getenv("SEED_BATCH_COMMIT", "50"))
+
+# ================== LOG ==================
 def log(msg: str):
     print(msg, flush=True, file=sys.stdout)
 
-def log_product(strategy: str, term: str, data: dict):
-    # imprime una línea JSON con campos clave (consumible por logs de Railway)
-    safe = {
-        "evt": "upsert_product",
-        "strategy": strategy,
-        "term": term,
-        "daterium_id": data.get("daterium_id"),
-        "name": data.get("name"),
-        "brand": data.get("brand"),
-        "family": data.get("family"),
-        "ean": data.get("ean"),
-        "pvp": data.get("pvp"),
-        "img": data.get("image_url") or data.get("thumb_url"),
-    }
-    log(json.dumps(safe, ensure_ascii=False))
+def log_json(**kv):
+    log(json.dumps(kv, ensure_ascii=False))
 
-# ... dentro de parse_and_upsert(), justo después de calcular variables y hacer upsert:
-pid = upsert_product(cur, daterium_id, nombre, descripcion, brand_id, family_id, ean, None, pvp, thumb, image_url)
-# imágenes...
-log_product(
-    strategy="(batch)",  # lo sobreescribimos en worker para saber el modo
-    term="(n/a)",
-    data={
-        "daterium_id": daterium_id,
-        "name": nombre,
-        "brand": marca_name,
-        "family": subfamilia_name or familia_name,
-        "ean": ean,
-        "pvp": pvp,
-        "image_url": image_url,
-        "thumb_url": thumb,
-    },
-)
-
-# ...en run_strategy(), dentro de worker(term: str), justo después de parse_and_upsert():
-n = parse_and_upsert(c2, xml)
-log(json.dumps({"evt":"batch_done","strategy":strategy,"term":term,"inserted_or_updated":n}, ensure_ascii=False))
-DATERIUM_USER_ID = os.getenv("DATERIUM_USER_ID", "").strip()
-def _effective_dsn() -> str:
-    dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL") or ""
-    # Si el DSN es interno (no resolvible en tu Mac), intenta el público
-    if (".internal" in dsn) or ("railway.internal" in dsn):
-        dsn_pub = os.getenv("DATABASE_PUBLIC_URL", "").strip()
-        if dsn_pub:
-            return dsn_pub
-    return dsn
-
-# Config
-MAX_CONCURRENCY = int(os.getenv("SEED_CONCURRENCY", "5"))
-RATE_DELAY      = float(os.getenv("SEED_RATE_DELAY", "0.4"))  # seg entre requests por worker
-BATCH_COMMIT    = int(os.getenv("SEED_BATCH_COMMIT", "50"))   # commit cada N productos
-
-# --- Helpers DB ---
-def ensure_cursor_table(conn: psycopg.Connection):
-    with conn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS ingest_cursor (
-          id          BIGSERIAL PRIMARY KEY,
-          strategy    TEXT NOT NULL,
-          cursor_key  TEXT NOT NULL,
-          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """)
-        cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_ingest_cursor_strategy
-          ON ingest_cursor(strategy);
-        """)
-    conn.commit()
-
+# ================== DB HELPERS ==================
 def db_conn():
     dsn = _effective_dsn()
     if not dsn:
-        raise SystemExit("DATABASE_URL/DATABASE_PUBLIC_URL missing")
+        raise SystemExit("DATABASE_URL / DATABASE_PUBLIC_URL no está definido")
     return psycopg.connect(dsn, autocommit=False)
+
 def upsert_brand(cur, name: Optional[str], logo_url: Optional[str]) -> Optional[int]:
     if not name: return None
     cur.execute("""
         INSERT INTO brands(name, logo_url)
         VALUES (%s, %s)
-        ON CONFLICT (name) DO UPDATE SET logo_url = COALESCE(EXCLUDED.logo_url, brands.logo_url)
+        ON CONFLICT (name)
+        DO UPDATE SET logo_url = COALESCE(EXCLUDED.logo_url, brands.logo_url)
         RETURNING id
     """, (name, logo_url))
     return cur.fetchone()[0]
@@ -102,7 +51,8 @@ def upsert_family(cur, name: Optional[str], parent_id: Optional[int] = None) -> 
     cur.execute("""
         INSERT INTO families(name, parent_id)
         VALUES (%s, %s)
-        ON CONFLICT (name) DO UPDATE SET parent_id = COALESCE(EXCLUDED.parent_id, families.parent_id)
+        ON CONFLICT (name)
+        DO UPDATE SET parent_id = COALESCE(EXCLUDED.parent_id, families.parent_id)
         RETURNING id
     """, (name, parent_id))
     return cur.fetchone()[0]
@@ -142,12 +92,38 @@ def upsert_image(cur, product_id: int, url: str, is_primary: bool):
         ON CONFLICT DO NOTHING
     """, (product_id, url, is_primary))
 
-def parse_float(txt: Optional[str]) -> Optional[float]:
-    if not txt: return None
-    try: return float(str(txt).replace(",", "."))
-    except Exception: return None
+def ensure_cursor_table(conn: psycopg.Connection):
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_cursor (
+          id          BIGSERIAL PRIMARY KEY,
+          strategy    TEXT NOT NULL,
+          cursor_key  TEXT NOT NULL,
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_ingest_cursor_strategy
+          ON ingest_cursor(strategy);
+        """)
+    conn.commit()
 
-# --- HTTP ---
+def get_cursor(conn: psycopg.Connection, strategy: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT cursor_key FROM ingest_cursor WHERE strategy = %s", (strategy,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+def set_cursor(conn: psycopg.Connection, strategy: str, key: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO ingest_cursor(strategy, cursor_key, updated_at)
+            VALUES (%s,%s,NOW())
+            ON CONFLICT (strategy) DO UPDATE SET cursor_key = EXCLUDED.cursor_key, updated_at = NOW()
+        """, (strategy, key))
+    conn.commit()
+
+# ================== HTTP/Parse ==================
 def make_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=httpx.Timeout(connect=8.0, read=50.0, write=10.0, pool=100.0),
@@ -155,12 +131,21 @@ def make_client() -> httpx.AsyncClient:
     )
 
 async def fetch_query(client: httpx.AsyncClient, query: str) -> Optional[bytes]:
+    if not DATERIUM_USER_ID:
+        raise SystemExit("Falta DATERIUM_USER_ID")
     url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(DATERIUM_USER_ID)}&searchbox={quote(query)}"
     try:
         r = await client.get(url)
         if r.status_code != 200:
             return None
         return r.content
+    except Exception:
+        return None
+
+def parse_float(txt: Optional[str]) -> Optional[float]:
+    if not txt: return None
+    try:
+        return float(str(txt).replace(",", "."))
     except Exception:
         return None
 
@@ -177,7 +162,8 @@ def parse_and_upsert(conn: psycopg.Connection, xml_bytes: bytes) -> int:
                     daterium_id = int(str(candidate).strip()); break
 
             nombre = (ficha.findtext("nombre") or "").strip()
-            if not nombre: continue
+            if not nombre:
+                continue
             descripcion = (ficha.findtext("descripcion") or "") or (ficha.findtext("descripcioncorta") or "")
             descripcion = (descripcion or "").strip()
 
@@ -187,9 +173,9 @@ def parse_and_upsert(conn: psycopg.Connection, xml_bytes: bytes) -> int:
             familia_name    = (ficha.findtext("familia") or "").strip() or None
             subfamilia_name = (ficha.findtext("subfamilia") or "").strip() or None
 
-            thumb = (ficha.findtext("thumb") or "").strip() or None
-            img280 = (ficha.findtext("img280x240") or "").strip() or None
-            img500 = (ficha.findtext("img500x500") or "").strip() or None
+            thumb    = (ficha.findtext("thumb") or "").strip() or None
+            img280   = (ficha.findtext("img280x240") or "").strip() or None
+            img500   = (ficha.findtext("img500x500") or "").strip() or None
             image_url = img500 or img280 or thumb
 
             ean = None; pvp = None
@@ -198,7 +184,7 @@ def parse_and_upsert(conn: psycopg.Connection, xml_bytes: bytes) -> int:
                 ean = (ref.findtext("ean") or "").strip() or None
                 pvp = parse_float(ref.findtext("pvp"))
 
-            brand_id = upsert_brand(cur, marca_name, logo_marca)
+            brand_id  = upsert_brand(cur, marca_name, logo_marca)
             parent_id = upsert_family(cur, familia_name, None) if familia_name else None
             family_id = upsert_family(cur, subfamilia_name, parent_id) if subfamilia_name else parent_id
 
@@ -209,26 +195,29 @@ def parse_and_upsert(conn: psycopg.Connection, xml_bytes: bytes) -> int:
             inserted += 1
     return inserted
 
-# --- Estrategias de generación de queries ---
+# ================== Generadores de claves ==================
 def gen_ngrams() -> Iterable[str]:
-    # 1 letra
-    for c in "abcdefghijklmnopqrstuvwxyz":
-        yield c
-    # 2 letras
     alpha = "abcdefghijklmnopqrstuvwxyz"
+    for c in alpha:
+        yield c
     for a in alpha:
         for b in alpha:
             yield a + b
-    # 3 letras parciales (para no desbordar): combinaciones frecuentes
-    common = ["bro", "pun", "ato", "tor", "per", "dis", "sie", "lla", "adh", "tor", "tiv", "viv", "cer", "met"]
+    common = ["bro","pun","ato","tor","per","dis","sie","lla","adh","tiv","cer","met"]
     for c in common:
         yield c
+
+def gen_trigrams() -> Iterable[str]:
+    alpha = "abcdefghijklmnopqrstuvwxyz"
+    for a in alpha:
+        for b in alpha:
+            for c in alpha:
+                yield a + b + c
 
 def gen_digits() -> Iterable[str]:
     for d in range(0, 100):
         yield str(d)
-    # EAN parciales comunes
-    for p in ["84", "80", "50", "40"]:
+    for p in ["84","80","50","40"]:
         yield p
 
 def gen_from_db(conn: psycopg.Connection, table: str) -> Iterable[str]:
@@ -238,32 +227,15 @@ def gen_from_db(conn: psycopg.Connection, table: str) -> Iterable[str]:
         for (name,) in cur.fetchall():
             if name: yield name
 
-# --- Cursor resumible ---
-def get_cursor(conn: psycopg.Connection, strategy: str) -> Optional[str]:
-    with conn.cursor() as cur:
-        cur.execute("SELECT cursor_key FROM ingest_cursor WHERE strategy = %s", (strategy,))
-        row = cur.fetchone()
-        return row[0] if row else None
-
-def set_cursor(conn: psycopg.Connection, strategy: str, key: str):
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO ingest_cursor(strategy, cursor_key, updated_at)
-            VALUES (%s,%s,NOW())
-            ON CONFLICT (strategy) DO UPDATE SET cursor_key = EXCLUDED.cursor_key, updated_at = NOW()
-        """, (strategy, key))
-    conn.commit()
-
-# --- Runner asíncrono ---
+# ================== Runner por estrategia ==================
 async def run_strategy(strategy: str):
     if not DATERIUM_USER_ID:
         raise SystemExit("Falta DATERIUM_USER_ID")
 
     conn = db_conn()
     ensure_cursor_table(conn)
-    cursor_key = get_cursor(conn, strategy)
 
-    # escoger generador
+    # Generar claves
     if strategy == "ngrams":
         keys = list(gen_ngrams())
     elif strategy == "digits":
@@ -272,23 +244,25 @@ async def run_strategy(strategy: str):
         keys = list(gen_from_db(conn, "brands"))
     elif strategy == "families":
         keys = list(gen_from_db(conn, "families"))
+    elif strategy == "trigrams":
+        keys = list(gen_trigrams())
     else:
         conn.close()
         raise SystemExit(f"Estrategia no soportada: {strategy}")
 
-    # si tenemos cursor, reanudar desde ahí
+    # Cursor resumible
+    cursor_key = get_cursor(conn, strategy)
     if cursor_key and cursor_key in keys:
         start = keys.index(cursor_key)
         keys = keys[start:]
-    random.shuffle(keys)  # para repartir carga
+    random.shuffle(keys)
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
     client = make_client()
-    total_inserted = 0
     processed = 0
 
     async def worker(term: str):
-        nonlocal total_inserted, processed
+        nonlocal processed
         async with sem:
             await asyncio.sleep(RATE_DELAY)
             xml = await fetch_query(client, term)
@@ -299,55 +273,78 @@ async def run_strategy(strategy: str):
                 try:
                     n = parse_and_upsert(c2, xml)
                     c2.commit()
-                    total_inserted += n
-                except Exception:
+                    log_json(evt="batch_done", strategy=strategy, term=term, inserted_or_updated=n)
+                except Exception as e:
                     c2.rollback()
+                    log_json(evt="batch_error", strategy=strategy, term=term, error=str(e))
             processed += 1
             set_cursor(conn, strategy, term)
 
     try:
-        for i in range(0, len(keys), 50):  # por lotes para no agotar memoria
+        for i in range(0, len(keys), 50):
             batch = keys[i:i+50]
             await asyncio.gather(*[worker(k) for k in batch])
-            print(f"[{strategy}] progreso: {processed}/{len(keys)} insertados/actualizados: {total_inserted}")
+            log_json(evt="progress", strategy=strategy, processed=processed, of=len(keys))
     finally:
         await client.aclose()
         conn.close()
 
+# ================== Loop infinito ==================
+def parse_modes(csv: str) -> list[str]:
+    allowed = {"brands","families","ngrams","digits","trigrams"}
+    modes = [m.strip() for m in csv.split(",") if m.strip()]
+    return [m for m in modes if m in allowed]
+
+def run_cycle(modes: list[str], idle_sleep: int = 600, max_errors: int = 10):
+    errors = 0
+    while True:
+        try:
+            with db_conn() as conn:
+                ensure_cursor_table(conn)
+        except Exception as e:
+            log(f"[loop] ensure_cursor_table error: {e}")
+            errors += 1
+            if errors >= max_errors:
+                log("[loop] demasiados errores. Saliendo.")
+                return
+            time.sleep(10)
+            continue
+
+        for m in modes:
+            try:
+                log(f"[loop] running strategy={m}")
+                asyncio.run(run_strategy(m))
+            except Exception as exc:
+                log(f"[loop] error en {m}: {exc}")
+                errors += 1
+                if errors >= max_errors:
+                    log("[loop] demasiados errores seguidos. Saliendo.")
+                    return
+
+        log(f"[loop] ciclo completo. Sleep {idle_sleep}s…")
+        time.sleep(idle_sleep)
+
+# ================== main ==================
 def main():
     import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["ngrams","digits","brands","families"], required=True)
+    p = argparse.ArgumentParser(description="Ingestor Daterium → Postgres")
+    p.add_argument("--mode", choices=["ngrams","digits","brands","families","trigrams"], help="Estrategia puntual")
+    p.add_argument("--modes", type=str, help="CSV para --loop (p.ej. brands,families,ngrams,digits)")
+    p.add_argument("--loop", action="store_true", help="Bucle infinito rotando estrategias")
+    p.add_argument("--idle-sleep", type=int, default=600, help="Espera entre ciclos en --loop (s)")
     args = p.parse_args()
-    asyncio.run(run_strategy(args.mode))
+
+    if args.loop:
+        modes = parse_modes(args.modes) if args.modes else ["brands","families","ngrams","digits"]
+        log_json(evt="loop_start", modes=modes, idle_sleep=args.idle_sleep)
+        run_cycle(modes, idle_sleep=args.idle_sleep)
+    else:
+        if not args.mode:
+            raise SystemExit("Indica --mode o usa --loop")
+        with db_conn() as conn:
+            ensure_cursor_table(conn)
+        log_json(evt="single_mode_start", mode=args.mode)
+        asyncio.run(run_strategy(args.mode))
 
 if __name__ == "__main__":
     main()
-    def run_cycle(modes: list[str], idle_sleep: int = 300, max_errors: int = 10):
-    errors = 0
-    while True:
-        cycle_inserted = 0
-        for m in modes:
-            try:
-                print(f"[loop] running strategy={m}", flush=True)
-                # Ejecutamos la estrategia concreta (asincrónica)
-                asyncio.run(run_strategy(m))
-                # Nota: run_strategy ya imprime progresos “batch_done”.
-                # Si quieres medir inserciones por ciclo con precisión, puedes:
-                #  - consultar /admin/count antes y después desde aquí (no HTTP interno),
-                #  - o añadir un return del total en run_strategy (requiere refactor).
-            except Exception as exc:
-                errors += 1
-                print(f"[loop] strategy={m} error: {exc}", flush=True)
-                if errors >= max_errors:
-                    print("[loop] demasiados errores seguidos, abortando", flush=True)
-                    return
-        # Sin métrica exacta, asumimos que hay ciclos “agotados” cuando no ves subir /admin/count
-        print(f"[loop] ciclo completo. Durmiendo {idle_sleep}s…", flush=True)
-        time.sleep(idle_sleep)
-
-
-def parse_modes(csv: str) -> list[str]:
-    ok = {"brands","families","ngrams","digits","trigrams"}
-    modes = [s.strip() for s in csv.split(",") if s.strip()]
-    return [m for m in modes if m in ok]
