@@ -1,216 +1,231 @@
 # app/search.py
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import os
-import time
-from typing import Dict, Iterable, Iterator, List, Optional
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional
 
-import httpx
-from lxml import etree
+import psycopg
+from fastapi import APIRouter, HTTPException, Query, Path
 
-# ========= Config =========
-DATERIUM_USER_ID = os.getenv("DATERIUM_USER_ID", "").strip()
-DATERIUM_BASE = "https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php"
-HTTP_TIMEOUT = httpx.Timeout(connect=5.0, read=25.0, write=10.0, pool=5.0)
-HTTP_HEADERS = {
-    "User-Agent": "CompraInteligente/1.0 (+konkabeza.com)",
-    "Accept": "application/xml,text/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
-}
+router = APIRouter(tags=["productos"])
 
-# ========= Caché (Redis si existe; si no, memoria local con TTL) =========
-_redis = None
-REDIS_URL = os.getenv("REDIS_URL", "").strip()
-if REDIS_URL:
+# ----------------- helpers -----------------
+def _dsn() -> str:
+    dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL no está definido")
+    return dsn
+
+def _conn():
+    return psycopg.connect(_dsn())
+
+def _wp_ficha_url(daterium_id: Optional[int], internal_id: int) -> str:
+    # Preferimos el id de Daterium si existe (tu WP usa ese ID en la ruta)
+    pid = str(daterium_id) if daterium_id else str(internal_id)
+    return f"https://konkabeza.com/ferretero/producto/{pid}/"
+
+def _google_url(nombre: str | None, ean: str | None) -> Optional[str]:
+    q = (ean or "").strip() or (nombre or "").strip()
+    if not q:
+        return None
+    return f"https://www.google.com/search?q={q.replace(' ', '+')}"
+
+# ----------------- /buscar -----------------
+@router.get("/buscar")
+def buscar(
+    q: str = Query(..., min_length=2, description="Texto libre: nombre, marca, ref, EAN"),
+    marca: Optional[str] = Query(None, description="Filtro por marca (ILIKE)"),
+    familia: Optional[str] = Query(None, description="Filtro por familia (ILIKE)"),
+    subfamilia: Optional[str] = Query(None, description="Filtro por subfamilia (ILIKE)"),
+    limit: int = Query(30, ge=1, le=100, description="Máximo de resultados"),
+):
+    """
+    Busca productos en la base local (products + brands + families).
+    Coincide por nombre/descripcion/EAN y permite filtros por marca/familia/subfamilia.
+    """
     try:
-        import redis  # type: ignore
-        _redis = redis.from_url(REDIS_URL)
-    except Exception:
-        _redis = None  # fallback a memoria
+        sql = """
+        SELECT
+            p.id AS pid,
+            p.daterium_id,
+            p.name,
+            p.description,
+            p.ean,
+            p.pvp,
+            p.thumb_url,
+            p.image_url,
+            b.name AS brand_name,
+            b.logo_url AS brand_logo,
+            f.name AS subfamily_name,
+            pf.name AS family_name
+        FROM products p
+        LEFT JOIN brands   b  ON b.id = p.brand_id
+        LEFT JOIN families f  ON f.id = p.family_id
+        LEFT JOIN families pf ON pf.id = f.parent_id
+        WHERE
+            (
+              p.name ILIKE %(q)s
+              OR COALESCE(p.description,'') ILIKE %(q)s
+              OR COALESCE(p.ean,'') ILIKE %(q_exact)s
+            )
+        """
+        params = {
+            "q": f"%{q}%",
+            "q_exact": f"%{q}%",
+        }
+        if marca:
+            sql += " AND b.name ILIKE %(marca)s"
+            params["marca"] = f"%{marca}%"
+        if familia:
+            sql += " AND pf.name ILIKE %(familia)s"
+            params["familia"] = f"%{familia}%"
+        if subfamilia:
+            sql += " AND f.name ILIKE %(subfamilia)s"
+            params["subfamilia"] = f"%{subfamilia}%"
 
-class _LocalTTLCache:
-    def __init__(self, max_items: int = 512):
-        self._data: Dict[str, tuple[float, object]] = {}
-        self._max = max_items
+        sql += " ORDER BY b.name NULLS LAST, p.name LIMIT %(limit)s"
+        params["limit"] = limit
 
-    def get(self, key: str):
-        now = time.time()
-        item = self._data.get(key)
-        if not item:
-            return None
-        exp, val = item
-        if exp < now:
-            self._data.pop(key, None)
-            return None
-        return val
+        out: List[Dict[str, Any]] = []
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                for (
+                    pid,
+                    daterium_id,
+                    name,
+                    description,
+                    ean,
+                    pvp,
+                    thumb_url,
+                    image_url,
+                    brand_name,
+                    brand_logo,
+                    subfamily_name,
+                    family_name,
+                ) in cur.fetchall():
+                    out.append({
+                        "id": daterium_id or pid,        # devolvemos el ID "útil" para WP/GPT
+                        "internal_id": pid,              # por si te hace falta
+                        "daterium_id": daterium_id,
+                        "nombre": name,
+                        "descripcion": description,
+                        "marca": brand_name,
+                        "familia": family_name,
+                        "subfamilia": subfamily_name,
+                        "ean": ean,
+                        "pvp": float(pvp) if pvp is not None else None,
+                        "thumb": thumb_url,
+                        "img": image_url or thumb_url,
+                        "brand_logo": brand_logo,
+                        "url_ficha": _wp_ficha_url(daterium_id, pid),
+                    })
 
-    def set(self, key: str, value, ttl: int):
-        # Evita crecer sin límite
-        if len(self._data) >= self._max:
-            # estrategia simple: borrar elementos expirados o el más antiguo
-            now = time.time()
-            expired = [k for k, (e, _) in self._data.items() if e < now]
-            if expired:
-                for k in expired:
-                    self._data.pop(k, None)
-            elif self._data:
-                self._data.pop(next(iter(self._data)))
-        self._data[key] = (time.time() + ttl, value)
+        return {"ok": True, "total": len(out), "productos": out}
 
-_local_cache = _LocalTTLCache()
+    except Exception as ex:
+        raise HTTPException(status_code=502, detail=f"Error en búsqueda: {ex}")
 
-def cache_get(key: str):
-    if _redis:
+# ----------------- /ficha/{id} -----------------
+@router.get("/ficha/{id}")
+def ficha_by_path(id: str = Path(..., description="ID de Daterium o ID interno")):
+    return _ficha_common(id)
+
+@router.get("/ficha")
+def ficha_by_query(id: str = Query(..., description="ID de Daterium o ID interno")):
+    return _ficha_common(id)
+
+def _ficha_common(id: str):
+    """
+    Devuelve la ficha de producto desde la base:
+    - Si id es numérico y existe como daterium_id → prioriza esa coincidencia
+    - Si no, busca por id interno (products.id)
+    Incluye imágenes (product_images), logo de marca y enlaces útiles.
+    """
+    try:
+        # preparar condiciones
+        id_num = None
         try:
-            raw = _redis.get(key)
-            if raw:
-                import json
-                return json.loads(raw)
+            id_num = int(id)
         except Exception:
             pass
-    return _LocalTTLCache.get(_local_cache, key)
 
-def cache_set(key: str, value, ttl: int = 900):
-    if _redis:
-        try:
-            import json
-            _redis.setex(key, ttl, json.dumps(value))
-            return
-        except Exception:
-            pass
-    _local_cache.set(key, value, ttl)
+        sql = """
+        SELECT
+            p.id AS pid,
+            p.daterium_id,
+            p.name,
+            p.description,
+            p.ean,
+            p.pvp,
+            p.thumb_url,
+            p.image_url,
+            b.name AS brand_name,
+            b.logo_url AS brand_logo,
+            f.name AS subfamily_name,
+            pf.name AS family_name
+        FROM products p
+        LEFT JOIN brands   b  ON b.id = p.brand_id
+        LEFT JOIN families f  ON f.id = p.family_id
+        LEFT JOIN families pf ON pf.id = f.parent_id
+        WHERE
+            (%(idnum)s IS NOT NULL AND p.daterium_id = %(idnum)s)
+            OR
+            (%(idnum)s IS NOT NULL AND p.id = %(idnum)s)
+        LIMIT 1
+        """
+        # Si id no es numérico, nunca encontrará nada. Forzamos 0 para no reventar
+        params = {"idnum": id_num if id_num is not None else -1}
 
-# ========= HTTP: descarga en streaming con reintentos =========
-def _daterium_url(query: str) -> str:
-    if not DATERIUM_USER_ID:
-        raise RuntimeError("Falta DATERIUM_USER_ID en variables de entorno.")
-    return f"{DATERIUM_BASE}?userID={quote(DATERIUM_USER_ID)}&searchbox={quote(query)}"
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Producto no encontrado")
 
-def fetch_xml_stream(url: str) -> Iterable[bytes]:
-    """
-    Descarga en streaming. Reintenta 2 veces en errores transitorios.
-    """
-    with httpx.Client(timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS) as client:
-        for attempt in range(3):
-            try:
-                with client.stream("GET", url) as resp:
-                    resp.raise_for_status()
-                    for chunk in resp.iter_bytes():
-                        if chunk:
-                            yield chunk
-                    return
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
-                if attempt == 2:
-                    raise
-                # reintento
-                continue
+                (
+                    pid,
+                    daterium_id,
+                    name,
+                    description,
+                    ean,
+                    pvp,
+                    thumb_url,
+                    image_url,
+                    brand_name,
+                    brand_logo,
+                    subfamily_name,
+                    family_name,
+                ) = row
 
-# ========= XML streaming parse =========
-def _text(elem: etree._Element, tag: str) -> str:
-    x = elem.findtext(tag)
-    return (x or "").strip()
+                # imágenes
+                cur.execute(
+                    "SELECT url, is_primary FROM product_images WHERE product_id = %s ORDER BY is_primary DESC, id",
+                    (pid,),
+                )
+                imgs = [{"url": u, "is_primary": bool(ip)} for (u, ip) in cur.fetchall()]
 
-def _first_text(elem: Optional[etree._Element], tag: str) -> str:
-    if elem is None:
-        return ""
-    x = elem.findtext(tag)
-    return (x or "").strip()
+        ficha = {
+            "id": daterium_id or pid,
+            "internal_id": pid,
+            "daterium_id": daterium_id,
+            "nombre": name,
+            "descripcion": description,
+            "marca": brand_name,
+            "brand_logo": brand_logo,
+            "familia": family_name,
+            "subfamilia": subfamily_name,
+            "ean": ean,
+            "pvp": float(pvp) if pvp is not None else None,
+            "thumb": thumb_url,
+            "img": image_url or (imgs[0]["url"] if imgs else None),
+            "imagenes": imgs,
+            "url_ficha_wp": _wp_ficha_url(daterium_id, pid),
+            "google_url": _google_url(name, ean),
+        }
+        return ficha
 
-def _best_image(ficha: etree._Element) -> str:
-    # Priorizamos tamaños más grandes si existen
-    candidates = [
-        "img1000x1000", "img800x800", "img600x600",
-        "img500x500", "img280x240", "img200x200",
-        "thumb", "img"
-    ]
-    for t in candidates:
-        val = _text(ficha, t)
-        if val:
-            return val
-    return ""
-
-def _extract_product(ficha: etree._Element) -> Dict[str, object]:
-    # Algunas respuestas traen múltiples referencias; tomamos la primera
-    ref = ficha.find(".//referencias/referencia")
-    return {
-        "id": _text(ficha, "id"),
-        "nombre": _text(ficha, "nombre"),
-        "marca": _text(ficha, "marca"),
-        "descripcion": _text(ficha, "descripcion") or _text(ficha, "descripcioncorta"),
-        "ean": _first_text(ref, "ean"),
-        "precio": _safe_float(_first_text(ref, "pvp")),
-        "unidades": _first_text(ref, "unidades") or _first_text(ref, "unidad"),
-        "imagen": _best_image(ficha),
-    }
-
-def _safe_float(v: str) -> Optional[float]:
-    try:
-        v = v.replace(",", ".")
-        f = float(v)
-        return f
-    except Exception:
-        return None
-
-def parse_products_from_xml_stream(chunks: Iterable[bytes], limit: int = 50) -> Iterator[Dict[str, object]]:
-    """
-    Parser incremental: procesa <ficha> a medida que llegan datos y libera memoria.
-    """
-    parser = etree.XMLPullParser(events=("end",))
-    count = 0
-    for chunk in chunks:
-        parser.feed(chunk)
-        for _, elem in parser.read_events():
-            if elem.tag == "ficha":
-                yield _extract_product(elem)
-                elem.clear()  # libera memoria del nodo
-                count += 1
-                if count >= limit:
-                    return
-
-# ========= API interna para FastAPI =========
-def search_products(query: str, limit: int = 30, cache_ttl: int = 900) -> List[Dict[str, object]]:
-    q = (query or "").strip()
-    if len(q) < 2:
-        return []
-    key = f"buscar:{q}:{limit}"
-    cached = cache_get(key)
-    if cached is not None:
-        return cached  # type: ignore
-
-    url = _daterium_url(q)
-    chunks = fetch_xml_stream(url)
-    items = list(parse_products_from_xml_stream(chunks, limit=max(1, min(limit, 100))))
-    # Normaliza campos mínimos
-    for p in items:
-        p.setdefault("marca", "")
-        p.setdefault("ean", "")
-        p.setdefault("precio", None)
-        p.setdefault("unidades", "")
-        p.setdefault("imagen", "")
-    cache_set(key, items, ttl=cache_ttl)
-    return items
-
-def get_product_by_id(product_id: str, cache_ttl: int = 900) -> Optional[Dict[str, object]]:
-    pid = (product_id or "").strip()
-    if not pid:
-        return None
-    key = f"ficha:{pid}"
-    cached = cache_get(key)
-    if cached is not None:
-        return cached  # type: ignore
-
-    # Estrategia simple: buscar por id y elegir la coincidencia exacta; si no, el primer resultado.
-    url = _daterium_url(pid)
-    chunks = fetch_xml_stream(url)
-    best: Optional[Dict[str, object]] = None
-    for p in parse_products_from_xml_stream(chunks, limit=50):
-        if p.get("id") == pid or (p.get("ean") and pid in str(p.get("ean"))):
-            best = p
-            break
-        if best is None:
-            best = p
-    if best:
-        cache_set(key, best, ttl=cache_ttl)
-    return best
+    except HTTPException:
+        raise
+    except Exception as ex:
+        raise HTTPException(status_code=502, detail=f"Error en ficha: {ex}")

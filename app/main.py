@@ -98,7 +98,8 @@ def ficha(id: str = Query(..., description="ID Daterium o EAN")):
     except Exception as ex:
         logger.exception("Error en /ficha: %s", ex)
         raise HTTPException(status_code=502, detail="Error al consultar proveedor")
-
+from app import search as search_router
+app.include_router(search_router.router, prefix="")
 # ------------------ Uvicorn (Railway) ------------------
 # Start Command en Railway:
 # uvicorn app.main:app --host 0.0.0.0 --port $PORT
