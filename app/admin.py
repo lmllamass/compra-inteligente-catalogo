@@ -58,3 +58,13 @@ def list_tables(token: str = Query(..., description="Security token")):
         return {"ok": True, "tables": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list failed: {e}")
+    
+    @router.get("/admin/count")
+def count_tables(token: str = Query(..., description="Security token")):
+    _check_token(token)
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM brands");   brands = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM families"); families = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM products"); products = cur.fetchone()[0]
+    return {"ok": True, "counts": {"brands": brands, "families": families, "products": products}}
