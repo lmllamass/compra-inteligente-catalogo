@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS ingest_cursor (id BIGSERIAL PRIMARY KEY, strategy TEXT NOT NULL, cursor_key TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); CREATE UNIQUE INDEX IF NOT EXISTS ux_ingest_cursor_strategy ON ingest_cursor(strategy);
