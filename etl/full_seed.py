@@ -6,7 +6,49 @@ import psycopg
 import httpx
 from lxml import etree
 from urllib.parse import quote
+# --- al inicio del archivo, junto a imports ---
+import json, sys
 
+def log(msg: str):
+    print(msg, flush=True, file=sys.stdout)
+
+def log_product(strategy: str, term: str, data: dict):
+    # imprime una línea JSON con campos clave (consumible por logs de Railway)
+    safe = {
+        "evt": "upsert_product",
+        "strategy": strategy,
+        "term": term,
+        "daterium_id": data.get("daterium_id"),
+        "name": data.get("name"),
+        "brand": data.get("brand"),
+        "family": data.get("family"),
+        "ean": data.get("ean"),
+        "pvp": data.get("pvp"),
+        "img": data.get("image_url") or data.get("thumb_url"),
+    }
+    log(json.dumps(safe, ensure_ascii=False))
+
+# ... dentro de parse_and_upsert(), justo después de calcular variables y hacer upsert:
+pid = upsert_product(cur, daterium_id, nombre, descripcion, brand_id, family_id, ean, None, pvp, thumb, image_url)
+# imágenes...
+log_product(
+    strategy="(batch)",  # lo sobreescribimos en worker para saber el modo
+    term="(n/a)",
+    data={
+        "daterium_id": daterium_id,
+        "name": nombre,
+        "brand": marca_name,
+        "family": subfamilia_name or familia_name,
+        "ean": ean,
+        "pvp": pvp,
+        "image_url": image_url,
+        "thumb_url": thumb,
+    },
+)
+
+# ...en run_strategy(), dentro de worker(term: str), justo después de parse_and_upsert():
+n = parse_and_upsert(c2, xml)
+log(json.dumps({"evt":"batch_done","strategy":strategy,"term":term,"inserted_or_updated":n}, ensure_ascii=False))
 DATERIUM_USER_ID = os.getenv("DATERIUM_USER_ID", "").strip()
 def _effective_dsn() -> str:
     dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL") or ""
@@ -23,6 +65,22 @@ RATE_DELAY      = float(os.getenv("SEED_RATE_DELAY", "0.4"))  # seg entre reques
 BATCH_COMMIT    = int(os.getenv("SEED_BATCH_COMMIT", "50"))   # commit cada N productos
 
 # --- Helpers DB ---
+def ensure_cursor_table(conn: psycopg.Connection):
+    with conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_cursor (
+          id          BIGSERIAL PRIMARY KEY,
+          strategy    TEXT NOT NULL,
+          cursor_key  TEXT NOT NULL,
+          updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_ingest_cursor_strategy
+          ON ingest_cursor(strategy);
+        """)
+    conn.commit()
+
 def db_conn():
     dsn = _effective_dsn()
     if not dsn:
@@ -201,6 +259,7 @@ async def run_strategy(strategy: str):
         raise SystemExit("Falta DATERIUM_USER_ID")
 
     conn = db_conn()
+    ensure_cursor_table(conn)
     cursor_key = get_cursor(conn, strategy)
 
     # escoger generador

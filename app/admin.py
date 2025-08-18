@@ -255,3 +255,41 @@ def ingest_stats(token: str = Query(..., description="Security token")):
             for r in rows
         ]
     }
+@router.get("/admin/recent")
+def recent_products(
+    token: str = Query(..., description="Security token"),
+    limit: int = Query(20, ge=1, le=200, description="cuántos items devolver")
+):
+    _check_token(token)
+    sql = """
+    SELECT
+      p.id, p.daterium_id, p.name, p.description, p.ean, p.pvp, p.thumb_url, p.image_url,
+      b.name AS brand, f.name AS subfamily, pf.name AS family
+    FROM products p
+    LEFT JOIN brands b   ON b.id = p.brand_id
+    LEFT JOIN families f ON f.id = p.family_id
+    LEFT JOIN families pf ON pf.id = f.parent_id
+    ORDER BY p.id DESC
+    LIMIT %s
+    """
+    try:
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, (limit,))
+                rows = cur.fetchall()
+        out = []
+        for (pid, did, name, desc, ean, pvp, thumb, img, brand, subfamily, family) in rows:
+            out.append({
+                "id": did or pid,
+                "internal_id": pid,
+                "nombre": name,
+                "marca": brand,
+                "familia": family,
+                "subfamilia": subfamily,
+                "ean": ean,
+                "pvp": float(pvp) if pvp is not None else None,
+                "img": img or thumb
+            })
+        return {"ok": True, "items": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"recent failed: {e}")
