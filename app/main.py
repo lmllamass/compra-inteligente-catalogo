@@ -10,6 +10,12 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.search import search_products, get_product_by_id
+from app import admin as admin_router
+...
+app.include_router(admin_router.router)
+
+
+
 
 # -----------------------------------------------------------
 # Configuración básica
