@@ -241,3 +241,17 @@ def seed_basic(token: str = Query(..., description="Security token"),
             conn.commit()
 
     return {"ok": True, "inserted_or_updated": total, "queries": q_list}
+@router.get("/admin/ingest_stats")
+def ingest_stats(token: str = Query(..., description="Security token")):
+    _check_token(token)
+    with psycopg.connect(_dsn()) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT strategy, cursor_key, updated_at FROM ingest_cursor ORDER BY updated_at DESC")
+            rows = cur.fetchall()
+    return {
+        "ok": True,
+        "stats": [
+            {"strategy": r[0], "cursor_key": r[1], "updated_at": r[2].isoformat()}
+            for r in rows
+        ]
+    }
