@@ -1,75 +1,84 @@
-# 1) crear carpeta y migración
-mkdir -p migrations
+-- ============================================
+-- Catálogo intermedio (marcas, familias, productos)
+-- ============================================
 
-cat > migrations/0002_catalog.sql <<'SQL'
--- Migración 0002: catálogo intermedio (marcas, familias, productos, imágenes, sinónimos, log)
--- Usa pg_trgm para búsquedas rápidas por texto (trigramas).
--- Doc oficial: https://www.postgresql.org/docs/current/pgtrgm.html
+-- Extensiones útiles (idempotentes)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
-BEGIN;
-
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-
--- MARCAS
+-- ==================
+-- Tabla: brands
+-- ==================
 CREATE TABLE IF NOT EXISTS brands (
-  brand_id   BIGSERIAL PRIMARY KEY,
-  name       TEXT UNIQUE NOT NULL
+  id            BIGSERIAL PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  daterium_id   BIGINT,
+  logo_url      TEXT,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- FAMILIAS
+-- ==================
+-- Tabla: families
+-- (puede modelar familia / subfamilia vía parent_id)
+-- ==================
 CREATE TABLE IF NOT EXISTS families (
-  family_id  BIGSERIAL PRIMARY KEY,
-  name       TEXT UNIQUE NOT NULL
+  id            BIGSERIAL PRIMARY KEY,
+  name          TEXT NOT NULL UNIQUE,
+  parent_id     BIGINT REFERENCES families(id) ON DELETE SET NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- PRODUCTOS (product_id = id Daterium u otros proveedores)
+-- ==================
+-- Tabla: products
+-- ==================
 CREATE TABLE IF NOT EXISTS products (
-  product_id   TEXT PRIMARY KEY,
-  brand_id     BIGINT REFERENCES brands(brand_id),
-  family_id    BIGINT REFERENCES families(family_id),
-  name         TEXT NOT NULL,
-  description  TEXT,
-  ean          TEXT,
-  unit         TEXT,
-  price        NUMERIC,
-  source       TEXT DEFAULT 'daterium',
-  updated_at   TIMESTAMPTZ DEFAULT now()
+  id             BIGSERIAL PRIMARY KEY,
+  daterium_id    BIGINT UNIQUE,             -- id del proveedor (Daterium)
+  name           TEXT NOT NULL,
+  description    TEXT,
+  brand_id       BIGINT REFERENCES brands(id) ON DELETE SET NULL,
+  family_id      BIGINT REFERENCES families(id) ON DELETE SET NULL,
+  ean            TEXT,
+  sku            TEXT,
+  pvp            NUMERIC(12,2),
+  thumb_url      TEXT,
+  image_url      TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- IMÁGENES (varias por producto)
+-- ==================
+-- Tabla: product_images (n imágenes por producto)
+-- ==================
 CREATE TABLE IF NOT EXISTS product_images (
-  product_id TEXT REFERENCES products(product_id) ON DELETE CASCADE,
-  url        TEXT NOT NULL,
-  priority   INT  DEFAULT 1,
-  PRIMARY KEY (product_id, url)
+  id           BIGSERIAL PRIMARY KEY,
+  product_id   BIGINT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  url          TEXT NOT NULL,
+  is_primary   BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- SINÓNIMOS / TÉRMINOS (mejora recall de búsqueda)
+-- ==================
+-- Tabla: product_synonyms (búsqueda mejorada)
+-- ==================
 CREATE TABLE IF NOT EXISTS product_synonyms (
-  product_id TEXT REFERENCES products(product_id) ON DELETE CASCADE,
-  term       TEXT NOT NULL,
-  kind       TEXT,
-  PRIMARY KEY (product_id, term)
+  id           BIGSERIAL PRIMARY KEY,
+  product_id   BIGINT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  term         TEXT NOT NULL
 );
 
--- LOG DE INGESTA
+-- ==================
+-- Tabla: ingest_log (auditoría de cargas)
+-- ==================
 CREATE TABLE IF NOT EXISTS ingest_log (
-  at         TIMESTAMPTZ DEFAULT now(),
-  provider   TEXT NOT NULL,
-  rows       INT  NOT NULL,
-  ok         BOOLEAN NOT NULL,
-  message    TEXT
+  id           BIGSERIAL PRIMARY KEY,
+  source       TEXT NOT NULL,         -- p.ej. 'daterium'
+  items        INTEGER NOT NULL,
+  started_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  finished_at  TIMESTAMPTZ
 );
 
--- ÍNDICES para búsqueda rápida (trigram y ean)
-CREATE INDEX IF NOT EXISTS idx_products_name_trgm ON products USING GIN (name gin_trgm_ops);
-CREATE INDEX IF NOT EXISTS idx_products_ean       ON products (ean);
-CREATE INDEX IF NOT EXISTS idx_brands_name_trgm   ON brands  USING GIN (name gin_trgm_ops);
-
-COMMIT;
-SQL
-
-# 2) commit + push
-git add migrations/0002_catalog.sql
-git commit -m "feat(db): esquema catálogo (pg_trgm + índices) – migración 0002"
-git push
+-- ======== Índices útiles ========
+CREATE INDEX IF NOT EXISTS idx_products_brand   ON products(brand_id);
+CREATE INDEX IF NOT EXISTS idx_products_family  ON products(family_id);
+CREATE INDEX IF NOT EXISTS idx_products_name    ON products USING GIN (to_tsvector('spanish', name));
+CREATE INDEX IF NOT EXISTS idx_products_desc    ON products USING GIN (to_tsvector('spanish', coalesce(description,'')));
+CREATE INDEX IF NOT EXISTS idx_products_ean     ON products(ean);
