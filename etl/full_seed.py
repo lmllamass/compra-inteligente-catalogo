@@ -8,7 +8,14 @@ from lxml import etree
 from urllib.parse import quote
 
 DATERIUM_USER_ID = os.getenv("DATERIUM_USER_ID", "").strip()
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL")
+def _effective_dsn() -> str:
+    dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL") or ""
+    # Si el DSN es interno (no resolvible en tu Mac), intenta el público
+    if (".internal" in dsn) or ("railway.internal" in dsn):
+        dsn_pub = os.getenv("DATABASE_PUBLIC_URL", "").strip()
+        if dsn_pub:
+            return dsn_pub
+    return dsn
 
 # Config
 MAX_CONCURRENCY = int(os.getenv("SEED_CONCURRENCY", "5"))
@@ -17,10 +24,10 @@ BATCH_COMMIT    = int(os.getenv("SEED_BATCH_COMMIT", "50"))   # commit cada N pr
 
 # --- Helpers DB ---
 def db_conn():
-    if not DATABASE_URL:
-        raise SystemExit("DATABASE_URL missing")
-    return psycopg.connect(DATABASE_URL, autocommit=False)
-
+    dsn = _effective_dsn()
+    if not dsn:
+        raise SystemExit("DATABASE_URL/DATABASE_PUBLIC_URL missing")
+    return psycopg.connect(dsn, autocommit=False)
 def upsert_brand(cur, name: Optional[str], logo_url: Optional[str]) -> Optional[int]:
     if not name: return None
     cur.execute("""
