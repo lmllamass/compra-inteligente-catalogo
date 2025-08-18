@@ -4,6 +4,7 @@ import os, asyncio, math, random
 from typing import List, Optional, Tuple, Iterable
 import psycopg
 import httpx
+import time
 from lxml import etree
 from urllib.parse import quote
 # --- al inicio del archivo, junto a imports ---
@@ -322,3 +323,31 @@ def main():
 
 if __name__ == "__main__":
     main()
+    def run_cycle(modes: list[str], idle_sleep: int = 300, max_errors: int = 10):
+    errors = 0
+    while True:
+        cycle_inserted = 0
+        for m in modes:
+            try:
+                print(f"[loop] running strategy={m}", flush=True)
+                # Ejecutamos la estrategia concreta (asincrónica)
+                asyncio.run(run_strategy(m))
+                # Nota: run_strategy ya imprime progresos “batch_done”.
+                # Si quieres medir inserciones por ciclo con precisión, puedes:
+                #  - consultar /admin/count antes y después desde aquí (no HTTP interno),
+                #  - o añadir un return del total en run_strategy (requiere refactor).
+            except Exception as exc:
+                errors += 1
+                print(f"[loop] strategy={m} error: {exc}", flush=True)
+                if errors >= max_errors:
+                    print("[loop] demasiados errores seguidos, abortando", flush=True)
+                    return
+        # Sin métrica exacta, asumimos que hay ciclos “agotados” cuando no ves subir /admin/count
+        print(f"[loop] ciclo completo. Durmiendo {idle_sleep}s…", flush=True)
+        time.sleep(idle_sleep)
+
+
+def parse_modes(csv: str) -> list[str]:
+    ok = {"brands","families","ngrams","digits","trigrams"}
+    modes = [s.strip() for s in csv.split(",") if s.strip()]
+    return [m for m in modes if m in ok]
