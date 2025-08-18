@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.search import search_products, get_product_by_id
-from app import admin as admin_router  # router admin (migración y ver tablas)
+from app import admin as admin_router  # << módulo admin; usaremos admin_router.router
 
 # ------------------ Logging ------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -39,7 +39,7 @@ app.add_middleware(
 )
 
 # Importante: incluir routers DESPUÉS de crear la app
-app.include_router(admin_router.router)
+app.include_router(admin_router.router)  # expone /admin/* (migrate, tables, debug_token_status)
 
 # ------------------ Infra ------------------
 @app.get("/health", tags=["infra"])
@@ -52,7 +52,7 @@ def root():
         "name": "Compra Inteligente – Backend",
         "version": "1.0.0",
         "docs": "/docs",
-        "endpoints": ["/buscar", "/ficha", "/health"],
+        "endpoints": ["/buscar", "/ficha", "/health", "/admin/*"],
     }
 
 # ------------------ Productos ------------------
@@ -102,10 +102,3 @@ def ficha(id: str = Query(..., description="ID Daterium o EAN")):
 # ------------------ Uvicorn (Railway) ------------------
 # Start Command en Railway:
 # uvicorn app.main:app --host 0.0.0.0 --port $PORT
-
-
-
-@router.get("/admin/debug_token_status")
-def debug_token_status():
-    val = os.getenv("MIGRATION_TOKEN", "")
-    return {"present": bool(val), "length": len(val)}
