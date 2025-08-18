@@ -82,3 +82,11 @@ CREATE INDEX IF NOT EXISTS idx_products_family  ON products(family_id);
 CREATE INDEX IF NOT EXISTS idx_products_name    ON products USING GIN (to_tsvector('spanish', name));
 CREATE INDEX IF NOT EXISTS idx_products_desc    ON products USING GIN (to_tsvector('spanish', coalesce(description,'')));
 CREATE INDEX IF NOT EXISTS idx_products_ean     ON products(ean);
+CREATE TABLE IF NOT EXISTS ingest_cursor (
+  id          BIGSERIAL PRIMARY KEY,
+  strategy    TEXT NOT NULL,          -- 'ngrams' | 'brands' | 'families' | 'digits'
+  cursor_key  TEXT NOT NULL,          -- última clave procesada (por ejemplo 'aa')
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ingest_cursor_strategy ON ingest_cursor(strategy);

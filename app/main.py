@@ -1,52 +1,16 @@
-# app/main.py
-from __future__ import annotations
-import os
-from typing import List
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["ngrams","digits","brands","families","trigrams"], help="Estrategia única")
+    p.add_argument("--modes", type=str, help="CSV de estrategias para loop: brands,families,ngrams,digits,trigrams")
+    p.add_argument("--loop", action="store_true", help="Ejecutar en bucle infinito (rotando estrategias)")
+    p.add_argument("--idle-sleep", type=int, default=300, help="Espera entre ciclos (segundos)")
+    args = p.parse_args()
 
-# Routers locales
-from app import admin as admin_router
-from app import search as search_router
-
-# ----- CORS -----
-_allowed = os.getenv("ALLOWED_ORIGINS", "https://konkabeza.com").strip()
-ALLOWED_ORIGINS: List[str] = [o.strip() for o in _allowed.split(",") if o.strip()]
-
-# ----- APP -----
-app = FastAPI(
-    title="Compra Inteligente – Backend",
-    version="1.0.0",
-    description="API de catálogo intermedio (Postgres) y utilidades admin."
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# ----- Routers -----
-# /admin/*  (migrate, tables, count, seed, etc.)
-app.include_router(admin_router.router)
-# /buscar, /ficha
-app.include_router(search_router.router)
-
-# ----- Infra -----
-@app.get("/health", tags=["infra"])
-def health():
-    return {"ok": True}
-
-@app.get("/", tags=["infra"])
-def root():
-    return {
-        "name": "Compra Inteligente – Backend",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "endpoints": ["/buscar", "/ficha", "/admin/*", "/health"],
-    }
-
-# Nota: Start Command (Railway)
-# uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    if args.loop:
+        modes = parse_modes(args.modes) if args.modes else ["brands","families","ngrams","digits"]
+        run_cycle(modes, idle_sleep=args.idle_sleep)
+    else:
+        if not args.mode:
+            raise SystemExit("Debes indicar --mode o usar --loop con --modes")
+        asyncio.run(run_strategy(args.mode))
