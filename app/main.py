@@ -5,7 +5,7 @@ from typing import List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Routers
+# Routers locales
 from app import admin as admin_router
 from app import search as search_router
 
@@ -29,8 +29,10 @@ app.add_middleware(
 )
 
 # ----- Routers -----
-app.include_router(admin_router.router)       # /admin/*
-app.include_router(search_router.router)      # /buscar, /ficha
+# /admin/*  (migrate, tables, count, seed, etc.)
+app.include_router(admin_router.router)
+# /buscar, /ficha
+app.include_router(search_router.router)
 
 # ----- Infra -----
 @app.get("/health", tags=["infra"])
@@ -46,5 +48,5 @@ def root():
         "endpoints": ["/buscar", "/ficha", "/admin/*", "/health"],
     }
 
-# Start Command en Railway:
+# Nota: Start Command (Railway)
 # uvicorn app.main:app --host 0.0.0.0 --port $PORT
