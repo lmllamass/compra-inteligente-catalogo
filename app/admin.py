@@ -8,6 +8,7 @@ import psycopg
 
 router = APIRouter(tags=["admin"])
 
+# ------- helpers -------
 def _dsn() -> str:
     dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL")
     if not dsn:
@@ -19,6 +20,19 @@ def _check_token(token: str):
     if not expected or token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+def _load_sql_file(rel_path: str) -> str:
+    """
+    Carga el SQL desde `rel_path` respecto a la raíz del repo.
+    Filtra líneas que empiecen por '#' (comentarios no válidos en Postgres).
+    """
+    sql_path = Path(__file__).resolve().parent.parent / rel_path
+    if not sql_path.exists():
+        raise HTTPException(status_code=500, detail=f"migration file not found: {rel_path}")
+    lines = sql_path.read_text(encoding="utf-8").splitlines()
+    cleaned = "\n".join(l for l in lines if not l.strip().startswith("#"))
+    return cleaned
+
+# ------- endpoints -------
 @router.get("/admin/debug_token_status")
 def debug_token_status():
     """No expone el token. Solo indica si está presente y su longitud."""
@@ -27,13 +41,12 @@ def debug_token_status():
 
 @router.post("/admin/migrate")
 def run_migration(token: str = Query(..., description="Security token")):
+    """
+    Ejecuta migrations/0002_catalog.sql en una transacción.
+    Requiere ?token=...
+    """
     _check_token(token)
-
-    sql_path = Path(__file__).resolve().parent.parent / "migrations" / "0002_catalog.sql"
-    if not sql_path.exists():
-        raise HTTPException(status_code=500, detail="migration file not found")
-
-    sql_text = sql_path.read_text(encoding="utf-8")
+    sql_text = _load_sql_file("migrations/0002_catalog.sql")
 
     try:
         with psycopg.connect(_dsn(), autocommit=False) as conn:
@@ -58,13 +71,22 @@ def list_tables(token: str = Query(..., description="Security token")):
         return {"ok": True, "tables": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list failed: {e}")
-    
-    @router.get("/admin/count")
+
+@router.get("/admin/count")
 def count_tables(token: str = Query(..., description="Security token")):
     _check_token(token)
-    with psycopg.connect(_dsn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM brands");   brands = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM families"); families = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM products"); products = cur.fetchone()[0]
-    return {"ok": True, "counts": {"brands": brands, "families": families, "products": products}}
+    try:
+        with psycopg.connect(_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM brands")
+                brands = cur.fetchone()[0]
+
+                cur.execute("SELECT COUNT(*) FROM families")
+                families = cur.fetchone()[0]
+
+                cur.execute("SELECT COUNT(*) FROM products")
+                products = cur.fetchone()[0]
+
+        return {"ok": True, "counts": {"brands": brands, "families": families, "products": products}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"count failed: {e}")
