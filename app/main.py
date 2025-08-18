@@ -102,3 +102,10 @@ def ficha(id: str = Query(..., description="ID Daterium o EAN")):
 # ------------------ Uvicorn (Railway) ------------------
 # Start Command en Railway:
 # uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+
+
+@router.get("/admin/debug_token_status")
+def debug_token_status():
+    val = os.getenv("MIGRATION_TOKEN", "")
+    return {"present": bool(val), "length": len(val)}
