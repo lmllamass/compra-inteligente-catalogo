@@ -375,3 +375,71 @@ def progress(token: str = Query(..., description="Security token")):
         else:
             out["latest"] = {"info": "ingest_log no existe"}
     return out
+# --- DEBUG: ver entorno y conexión rápida ---
+@router.get("/debug_env")
+def debug_env(token: str = Query(...)):
+    _check_token(token)
+    # NO devolvemos credenciales, solo presencia
+    keys = ["DATABASE_URL", "PGDATABASE_URL", "DATABASE_PUBLIC_URL"]
+    present = {k: bool(os.getenv(k)) for k in keys}
+    # además, mostramos cuál DSN usaría _dsn()
+    dsn_status = "ok"
+    dsn_val = None
+    try:
+        dsn_val = _dsn()
+    except Exception as e:
+        dsn_status = f"error: {e}"
+    return {"ok": True, "present": present, "dsn_status": dsn_status, "using": dsn_val is not None}
+
+@router.get("/debug_sql")
+def debug_sql(token: str = Query(...)):
+    _check_token(token)
+    try:
+        with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+            cur.execute("SELECT version(), now()")
+            ver, now = cur.fetchone()
+        return {"ok": True, "version": ver, "now": str(now)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# --- versión más defensiva de /admin/progress con detalle de error ---
+@router.get("/progress_safe")
+def progress_safe(token: str = Query(...)):
+    _check_token(token)
+    out = {"ok": True, "counts": {}, "latest": {}, "errors": []}
+    try:
+        with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+            # counts (cada tabla en try para no romper todo)
+            for t in ("brands", "families", "products"):
+                try:
+                    cur.execute(f"SELECT COUNT(*) FROM {t}")
+                    out["counts"][t] = cur.fetchone()[0]
+                except Exception as e:
+                    out["counts"][t] = None
+                    out["errors"].append(f"count {t}: {e}")
+
+            # latest ingest_log si existe
+            try:
+                cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
+                if cur.fetchone()[0]:
+                    cur.execute("""
+                        SELECT ts, strategy, item_key, status, note
+                        FROM ingest_log
+                        ORDER BY ts DESC
+                        LIMIT 1
+                    """)
+                    r = cur.fetchone()
+                    if r:
+                        ts, s, k, st, n = r
+                        out["latest"] = {
+                            "ts": str(ts), "strategy": s, "item_key": k,
+                            "status": st, "note": n
+                        }
+                else:
+                    out["latest"] = {"info": "ingest_log no existe"}
+            except Exception as e:
+                out["errors"].append(f"latest ingest_log: {e}")
+    except Exception as e:
+        return {"ok": False, "fatal": str(e)}
+
+    return out
