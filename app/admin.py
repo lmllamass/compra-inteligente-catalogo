@@ -1,45 +1,65 @@
 # app/admin.py
 from __future__ import annotations
+
 import os
 from pathlib import Path
+from typing import Optional, List, Dict, Any
 
-from fastapi import APIRouter, HTTPException, Query
 import psycopg
+from fastapi import APIRouter, HTTPException, Query
 
-router = APIRouter(tags=["admin"])
+# Opcionales para semilla desde Daterium
+import httpx
+from lxml import etree
+from urllib.parse import quote
 
-# ------- helpers -------
+router = APIRouter(prefix="/admin", tags=["admin"])
+
+# -------------------- helpers --------------------
 def _dsn() -> str:
     dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL")
     if not dsn:
         raise HTTPException(status_code=500, detail="DATABASE_URL missing")
     return dsn
 
-def _check_token(token: str):
+def _check_token(token: Optional[str]):
     expected = os.getenv("MIGRATION_TOKEN", "")
     if not expected or token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 def _load_sql_file(rel_path: str) -> str:
     """
-    Carga el SQL desde `rel_path` respecto a la raíz del repo.
-    Filtra líneas que empiecen por '#' (comentarios no válidos en Postgres).
+    Carga SQL desde rel_path (relativo a la raíz del repo).
+    Elimina líneas que empiezan por '#' (comentarios no válidos en Postgres).
     """
     sql_path = Path(__file__).resolve().parent.parent / rel_path
     if not sql_path.exists():
         raise HTTPException(status_code=500, detail=f"migration file not found: {rel_path}")
     lines = sql_path.read_text(encoding="utf-8").splitlines()
-    cleaned = "\n".join(l for l in lines if not l.strip().startswith("#"))
-    return cleaned
+    return "\n".join(l for l in lines if not l.strip().startswith("#"))
 
-# ------- endpoints -------
-@router.get("/admin/debug_token_status")
+def _http() -> httpx.Client:
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=5.0),
+        headers={"User-Agent": "CompraInteligente/1.0", "Accept": "application/xml"},
+    )
+
+def _parse_float(txt: Optional[str]) -> Optional[float]:
+    if not txt:
+        return None
+    try:
+        return float(str(txt).replace(",", "."))
+    except Exception:
+        return None
+
+# -------------------- endpoints base --------------------
+@router.get("/debug_token_status")
 def debug_token_status():
     """No expone el token. Solo indica si está presente y su longitud."""
     val = os.getenv("MIGRATION_TOKEN", "")
     return {"present": bool(val), "length": len(val)}
 
-@router.post("/admin/migrate")
+@router.post("/migrate")
 def run_migration(token: str = Query(..., description="Security token")):
     """
     Ejecuta migrations/0002_catalog.sql en una transacción.
@@ -47,7 +67,6 @@ def run_migration(token: str = Query(..., description="Security token")):
     """
     _check_token(token)
     sql_text = _load_sql_file("migrations/0002_catalog.sql")
-
     try:
         with psycopg.connect(_dsn(), autocommit=False) as conn:
             with conn.cursor() as cur:
@@ -57,104 +76,101 @@ def run_migration(token: str = Query(..., description="Security token")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"migration failed: {e}")
 
-@router.get("/admin/tables")
+@router.get("/tables")
 def list_tables(token: str = Query(..., description="Security token")):
     _check_token(token)
     try:
         with psycopg.connect(_dsn()) as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT tablename FROM pg_tables "
-                    "WHERE schemaname='public' ORDER BY tablename"
-                )
+                cur.execute("""
+                    SELECT tablename
+                    FROM pg_tables
+                    WHERE schemaname='public'
+                    ORDER BY tablename
+                """)
                 rows = [r[0] for r in cur.fetchall()]
         return {"ok": True, "tables": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list failed: {e}")
 
-@router.get("/admin/count")
+@router.get("/count")
 def count_tables(token: str = Query(..., description="Security token")):
     _check_token(token)
     try:
         with psycopg.connect(_dsn()) as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM brands")
-                brands = cur.fetchone()[0]
+                def count_of(tbl: str) -> Optional[int]:
+                    try:
+                        cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+                        return cur.fetchone()[0]
+                    except Exception:
+                        return None
 
-                cur.execute("SELECT COUNT(*) FROM families")
-                families = cur.fetchone()[0]
-
-                cur.execute("SELECT COUNT(*) FROM products")
-                products = cur.fetchone()[0]
-
-        return {"ok": True, "counts": {"brands": brands, "families": families, "products": products}}
+                counts = {
+                    "brands":   count_of("brands"),
+                    "families": count_of("families"),
+                    "products": count_of("products"),
+                }
+        return {"ok": True, "counts": counts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"count failed: {e}")
-    # ====== CARGA BÁSICA (semilla) DESDE DATERIUM ======
-import httpx
-from lxml import etree
-from urllib.parse import quote
 
-SEED_QUERIES = [
+# -------------------- semilla desde Daterium --------------------
+SEED_QUERIES: List[str] = [
     "tivoly", "broca", "punta", "atornillado", "anclaje",
     "disco", "llave", "sierra", "adhesivo", "tornillo", "tuerca", "arandela"
 ]
 
-def _http():
-    return httpx.Client(
-        timeout=httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=5.0),
-        headers={"User-Agent": "CompraInteligente/1.0", "Accept": "application/xml"},
-    )
-
-def _parse_float(txt: str | None) -> float | None:
-    if not txt: return None
-    try: return float(str(txt).replace(",", "."))
-    except Exception: return None
-
-def _upsert_brand(cur, name: str | None, logo_url: str | None) -> int | None:
-    if not name: return None
+def _upsert_brand(cur, name: Optional[str], logo_url: Optional[str]) -> Optional[int]:
+    if not name:
+        return None
     cur.execute("""
         INSERT INTO brands(name, logo_url)
         VALUES (%s, %s)
-        ON CONFLICT (name) DO UPDATE SET logo_url = COALESCE(EXCLUDED.logo_url, brands.logo_url)
+        ON CONFLICT (name) DO UPDATE
+          SET logo_url = COALESCE(EXCLUDED.logo_url, brands.logo_url)
         RETURNING id
     """, (name, logo_url))
     return cur.fetchone()[0]
 
-def _upsert_family(cur, name: str | None, parent_id: int | None = None) -> int | None:
-    if not name: return None
+def _upsert_family(cur, name: Optional[str], parent_id: Optional[int] = None) -> Optional[int]:
+    if not name:
+        return None
     cur.execute("""
         INSERT INTO families(name, parent_id)
         VALUES (%s, %s)
-        ON CONFLICT (name) DO UPDATE SET parent_id = COALESCE(EXCLUDED.parent_id, families.parent_id)
+        ON CONFLICT (name) DO UPDATE
+          SET parent_id = COALESCE(EXCLUDED.parent_id, families.parent_id)
         RETURNING id
     """, (name, parent_id))
     return cur.fetchone()[0]
 
-def _upsert_product(cur,
-                    daterium_id: int | None,
-                    name: str,
-                    description: str | None,
-                    brand_id: int | None,
-                    family_id: int | None,
-                    ean: str | None,
-                    sku: str | None,
-                    pvp: float | None,
-                    thumb_url: str | None,
-                    image_url: str | None) -> int:
+def _upsert_product(
+    cur,
+    daterium_id: Optional[int],
+    name: str,
+    description: Optional[str],
+    brand_id: Optional[int],
+    family_id: Optional[int],
+    ean: Optional[str],
+    sku: Optional[str],
+    pvp: Optional[float],
+    thumb_url: Optional[str],
+    image_url: Optional[str],
+) -> int:
     cur.execute("""
         INSERT INTO products(daterium_id, name, description, brand_id, family_id, ean, sku, pvp, thumb_url, image_url)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (daterium_id) DO UPDATE
-          SET name = EXCLUDED.name,
+          SET name        = EXCLUDED.name,
               description = COALESCE(EXCLUDED.description, products.description),
-              brand_id = COALESCE(EXCLUDED.brand_id, products.brand_id),
-              family_id = COALESCE(EXCLUDED.family_id, products.family_id),
-              ean = COALESCE(EXCLUDED.ean, products.ean),
-              sku = COALESCE(EXCLUDED.sku, products.sku),
-              pvp = COALESCE(EXCLUDED.pvp, products.pvp),
-              thumb_url = COALESCE(EXCLUDED.thumb_url, products.thumb_url),
-              image_url = COALESCE(EXCLUDED.image_url, products.image_url)
+              brand_id    = COALESCE(EXCLUDED.brand_id, products.brand_id),
+              family_id   = COALESCE(EXCLUDED.family_id, products.family_id),
+              ean         = COALESCE(EXCLUDED.ean, products.ean),
+              sku         = COALESCE(EXCLUDED.sku, products.sku),
+              pvp         = COALESCE(EXCLUDED.pvp, products.pvp),
+              thumb_url   = COALESCE(EXCLUDED.thumb_url, products.thumb_url),
+              image_url   = COALESCE(EXCLUDED.image_url, products.image_url)
         RETURNING id
     """, (daterium_id, name, description, brand_id, family_id, ean, sku, pvp, thumb_url, image_url))
     return cur.fetchone()[0]
@@ -166,14 +182,15 @@ def _upsert_image(cur, product_id: int, url: str, is_primary: bool):
         ON CONFLICT DO NOTHING
     """, (product_id, url, is_primary))
 
-@router.post("/admin/seed_basic")
-def seed_basic(token: str = Query(..., description="Security token"),
-               queries: str = Query(None, description="CSV de términos. Si no, usa los de SEED_QUERIES")):
+@router.post("/seed_basic")
+def seed_basic(
+    token: str = Query(..., description="Security token"),
+    queries: Optional[str] = Query(None, description="CSV de términos. Si no, usa los de SEED_QUERIES"),
+):
     """
-    Carga básica: ejecuta varias búsquedas en Daterium y persiste marcas/familias/productos.
-    Param:
-      - token: MIGRATION_TOKEN
-      - queries (opcional): 'tivoly,broca,disco'
+    Carga básica: lanza búsquedas en Daterium y persiste marcas/familias/productos.
+    - token: MIGRATION_TOKEN
+    - queries (opcional): 'tivoly,broca,disco'
     """
     _check_token(token)
     user_id = os.getenv("DATERIUM_USER_ID", "").strip()
@@ -183,15 +200,14 @@ def seed_basic(token: str = Query(..., description="Security token"),
     q_list = [q.strip() for q in (queries.split(",") if queries else SEED_QUERIES) if q.strip()]
     total = 0
 
-    with psycopg.connect(_dsn(), autocommit=False) as conn:
-        with conn.cursor() as cur:
+    with psycopg.connect(_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        with _http() as c:
             for q in q_list:
                 url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(q)}"
-                with _http() as c:
-                    r = c.get(url)
-                    if r.status_code != 200:
-                        continue
-                    root = etree.fromstring(r.content)
+                r = c.get(url)
+                if r.status_code != 200:
+                    continue
+                root = etree.fromstring(r.content)
 
                 for ficha in root.xpath(".//ficha"):
                     id_txt = ficha.findtext("id")
@@ -205,6 +221,7 @@ def seed_basic(token: str = Query(..., description="Security token"),
                     nombre = (ficha.findtext("nombre") or "").strip()
                     if not nombre:
                         continue
+
                     descripcion = (ficha.findtext("descripcion") or "") or (ficha.findtext("descripcioncorta") or "")
                     descripcion = (descripcion or "").strip()
 
@@ -219,7 +236,8 @@ def seed_basic(token: str = Query(..., description="Security token"),
                     img500 = (ficha.findtext("img500x500") or "").strip() or None
                     image_url = img500 or img280 or thumb
 
-                    ean = None; pvp = None
+                    ean = None
+                    pvp = None
                     ref = ficha.find(".//referencias/referencia")
                     if ref is not None:
                         ean = (ref.findtext("ean") or "").strip() or None
@@ -232,33 +250,42 @@ def seed_basic(token: str = Query(..., description="Security token"),
 
                     pid = _upsert_product(cur, daterium_id, nombre, descripcion, brand_id, family_id, ean, None, pvp, thumb, image_url)
 
-                    if thumb:  _upsert_image(cur, pid, thumb,  image_url == thumb)
-                    if img280: _upsert_image(cur, pid, img280, image_url == img280)
-                    if img500: _upsert_image(cur, pid, img500, image_url == img500)
+                    if thumb:
+                        _upsert_image(cur, pid, thumb, image_url == thumb)
+                    if img280:
+                        _upsert_image(cur, pid, img280, image_url == img280)
+                    if img500:
+                        _upsert_image(cur, pid, img500, image_url == img500)
 
                     total += 1
 
-            conn.commit()
+        conn.commit()
 
     return {"ok": True, "inserted_or_updated": total, "queries": q_list}
-@router.get("/admin/ingest_stats")
+
+# -------------------- monitorización de ingesta --------------------
+@router.get("/ingest_stats")
 def ingest_stats(token: str = Query(..., description="Security token")):
     _check_token(token)
-    with psycopg.connect(_dsn()) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT strategy, cursor_key, updated_at FROM ingest_cursor ORDER BY updated_at DESC")
-            rows = cur.fetchall()
+    with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT strategy, cursor_key, updated_at
+            FROM ingest_cursor
+            ORDER BY updated_at DESC
+        """)
+        rows = cur.fetchall()
     return {
         "ok": True,
         "stats": [
             {"strategy": r[0], "cursor_key": r[1], "updated_at": r[2].isoformat()}
             for r in rows
-        ]
+        ],
     }
-@router.get("/admin/recent")
+
+@router.get("/recent")
 def recent_products(
     token: str = Query(..., description="Security token"),
-    limit: int = Query(20, ge=1, le=200, description="cuántos items devolver")
+    limit: int = Query(20, ge=1, le=200, description="cuántos items devolver"),
 ):
     _check_token(token)
     sql = """
@@ -273,11 +300,10 @@ def recent_products(
     LIMIT %s
     """
     try:
-        with psycopg.connect(_dsn()) as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (limit,))
-                rows = cur.fetchall()
-        out = []
+        with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+            cur.execute(sql, (limit,))
+            rows = cur.fetchall()
+        out: List[Dict[str, Any]] = []
         for (pid, did, name, desc, ean, pvp, thumb, img, brand, subfamily, family) in rows:
             out.append({
                 "id": did or pid,
@@ -288,57 +314,64 @@ def recent_products(
                 "subfamilia": subfamily,
                 "ean": ean,
                 "pvp": float(pvp) if pvp is not None else None,
-                "img": img or thumb
+                "img": img or thumb,
             })
         return {"ok": True, "items": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"recent failed: {e}")
-    # app/admin.py
-from fastapi import APIRouter, Depends, HTTPException, Query
-from typing import Optional
-import os
-from app.db import get_db
-
-router = APIRouter(prefix="/admin", tags=["admin"])
-MIGRATION_TOKEN = os.environ.get("MIGRATION_TOKEN", "KZ-setup-2025-08")
-
-def _check_token(token: Optional[str]):
-    if not token or token != MIGRATION_TOKEN:
-        raise HTTPException(status_code=401, detail="Unauthorized")
 
 @router.get("/ingest_log")
-def ingest_log(token: str = Query(...), limit: int = Query(50, ge=1, le=500), db=Depends(get_db)):
+def ingest_log(
+    token: str = Query(..., description="Security token"),
+    limit: int = Query(50, ge=1, le=500),
+):
     _check_token(token)
-    with db.cursor() as cur:
+    with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
         cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
         if not cur.fetchone()[0]:
             return {"ok": False, "reason": "table_not_found"}
         cur.execute("""
             SELECT ts, strategy, item_key, status, note
-            FROM ingest_log ORDER BY ts DESC LIMIT %s
+            FROM ingest_log
+            ORDER BY ts DESC
+            LIMIT %s
         """, (limit,))
         rows = [{"ts": str(ts), "strategy": s, "item_key": k, "status": st, "note": n}
                 for (ts, s, k, st, n) in cur.fetchall()]
     return {"ok": True, "rows": rows, "limit": limit}
 
 @router.get("/progress")
-def progress(token: str = Query(...), db=Depends(get_db)):
+def progress(token: str = Query(..., description="Security token")):
     _check_token(token)
-    out = {"ok": True, "counts": {}, "latest": {}}
-    with db.cursor() as cur:
+    out: Dict[str, Any] = {"ok": True, "counts": {}, "latest": {}}
+    with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+        # counts
         for t in ("brands", "families", "products"):
-            cur.execute(f"SELECT COUNT(*) FROM {t}")
-            out["counts"][t] = cur.fetchone()[0]
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {t}")
+                out["counts"][t] = cur.fetchone()[0]
+            except Exception:
+                out["counts"][t] = None
+
+        # latest row in ingest_log
         cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
         if cur.fetchone()[0]:
             cur.execute("""
                 SELECT ts, strategy, item_key, status, note
-                FROM ingest_log ORDER BY ts DESC LIMIT 1
+                FROM ingest_log
+                ORDER BY ts DESC
+                LIMIT 1
             """)
             r = cur.fetchone()
             if r:
                 ts, s, k, st, n = r
-                out["latest"] = {"ts": str(ts), "strategy": s, "item_key": k, "status": st, "note": n}
+                out["latest"] = {
+                    "ts": str(ts),
+                    "strategy": s,
+                    "item_key": k,
+                    "status": st,
+                    "note": n,
+                }
         else:
             out["latest"] = {"info": "ingest_log no existe"}
     return out
