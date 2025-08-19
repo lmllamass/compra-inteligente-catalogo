@@ -293,3 +293,52 @@ def recent_products(
         return {"ok": True, "items": out}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"recent failed: {e}")
+    # app/admin.py
+from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import Optional
+import os
+from app.db import get_db
+
+router = APIRouter(prefix="/admin", tags=["admin"])
+MIGRATION_TOKEN = os.environ.get("MIGRATION_TOKEN", "KZ-setup-2025-08")
+
+def _check_token(token: Optional[str]):
+    if not token or token != MIGRATION_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@router.get("/ingest_log")
+def ingest_log(token: str = Query(...), limit: int = Query(50, ge=1, le=500), db=Depends(get_db)):
+    _check_token(token)
+    with db.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
+        if not cur.fetchone()[0]:
+            return {"ok": False, "reason": "table_not_found"}
+        cur.execute("""
+            SELECT ts, strategy, item_key, status, note
+            FROM ingest_log ORDER BY ts DESC LIMIT %s
+        """, (limit,))
+        rows = [{"ts": str(ts), "strategy": s, "item_key": k, "status": st, "note": n}
+                for (ts, s, k, st, n) in cur.fetchall()]
+    return {"ok": True, "rows": rows, "limit": limit}
+
+@router.get("/progress")
+def progress(token: str = Query(...), db=Depends(get_db)):
+    _check_token(token)
+    out = {"ok": True, "counts": {}, "latest": {}}
+    with db.cursor() as cur:
+        for t in ("brands", "families", "products"):
+            cur.execute(f"SELECT COUNT(*) FROM {t}")
+            out["counts"][t] = cur.fetchone()[0]
+        cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
+        if cur.fetchone()[0]:
+            cur.execute("""
+                SELECT ts, strategy, item_key, status, note
+                FROM ingest_log ORDER BY ts DESC LIMIT 1
+            """)
+            r = cur.fetchone()
+            if r:
+                ts, s, k, st, n = r
+                out["latest"] = {"ts": str(ts), "strategy": s, "item_key": k, "status": st, "note": n}
+        else:
+            out["latest"] = {"info": "ingest_log no existe"}
+    return out

@@ -14,3 +14,9 @@ def main():
         if not args.mode:
             raise SystemExit("Debes indicar --mode o usar --loop con --modes")
         asyncio.run(run_strategy(args.mode))
+        # app/main.py (fragmento)
+from fastapi import FastAPI
+from app import admin as admin_router
+
+app = FastAPI()
+app.include_router(admin_router.router)
