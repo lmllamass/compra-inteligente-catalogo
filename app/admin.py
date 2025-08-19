@@ -17,11 +17,64 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 
 # -------------------- helpers --------------------
 def _dsn() -> str:
-    dsn = os.getenv("DATABASE_URL") or os.getenv("PGDATABASE_URL")
-    if not dsn:
-        raise HTTPException(status_code=500, detail="DATABASE_URL missing")
-    return dsn
+    """
+    Elige el DSN correcto y fija sslmode según el tipo de endpoint.
+    - Privado (railway.internal / IP RFC4193): sslmode=disable
+    - Público (tcp.railway.app / IP pública): sslmode=require
+    Prioridad: DATABASE_URL > PGDATABASE_URL > DATABASE_PUBLIC_URL
+    """
+    import re
+    for key in ("DATABASE_URL", "PGDATABASE_URL", "DATABASE_PUBLIC_URL"):
+        val = os.getenv(key)
+        if not val:
+            continue
 
+        # ¿Ya trae parámetros?
+        sep = "&" if "?" in val else "?"
+
+        # Hostname para decidir SSL
+        host = None
+        try:
+            host = re.search(r'@([^/:]+)', val).group(1)
+        except Exception:
+            pass
+
+        # Heurística: interno vs público
+        is_private = False
+        if host:
+            # dominios internos de Railway
+            if ".railway.internal" in host:
+                is_private = True
+            # IPv6 ULA (fd00::/8)
+            if ":" in host and host.lower().startswith("fd"):
+                is_private = True
+
+        if is_private:
+            if "sslmode=" not in val:
+                val = f"{val}{sep}sslmode=disable"
+        else:
+            if "sslmode=" not in val:
+                val = f"{val}{sep}sslmode=require"
+
+        return val
+
+    raise HTTPException(status_code=500, detail="No DATABASE_URL/PGDATABASE_URL/DATABASE_PUBLIC_URL set")
+def _connect():
+    dsn = _dsn()
+    # keepalives y reintentos suaves
+    from time import sleep
+    last_err = None
+    for _ in range(3):
+        try:
+            return psycopg.connect(
+                dsn,
+                connect_timeout=8,
+                options="-c statement_timeout=30000 -c idle_in_transaction_session_timeout=30000"
+            )
+        except Exception as e:
+            last_err = e
+            sleep(1.0)
+    raise HTTPException(status_code=500, detail=f"DB connect failed: {last_err}")
 def _check_token(token: Optional[str]):
     expected = os.getenv("MIGRATION_TOKEN", "")
     if not expected or token != expected:
