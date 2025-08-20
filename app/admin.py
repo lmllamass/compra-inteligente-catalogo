@@ -720,3 +720,120 @@ def backfill_ean_batch(
         "details": details[:50],
         "more": scanned == limit  # si true, probablemente quedan más por procesar
     }
+# --- BACKFILL EAN EN TANDAS (siempre JSON) ---
+from time import sleep
+
+def _daterium_fetch_xml(user_id: str, query: str) -> bytes:
+    url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(query)}"
+    with _http() as c:
+        r = c.get(url)
+        r.raise_for_status()
+        return r.content
+
+def _extract_first_ean_from_xml(xml_bytes: bytes) -> str | None:
+    root = etree.fromstring(xml_bytes)
+    # coge la primera ficha con referencia y EAN válido
+    for ref in root.xpath(".//ficha/referencias/referencia"):
+        ean = (ref.findtext("ean") or "").strip()
+        if ean:
+            return ean
+    return None
+
+@router.post("/backfill_ean_batch")
+def backfill_ean_batch(
+    token: str = Query(..., description="Security token"),
+    limit: int = Query(200, ge=1, le=2000, description="Nº de productos por tanda"),
+    pause_ms: int = Query(150, ge=0, le=2000, description="Pausa entre items en milisegundos"),
+    dry: bool = Query(False, description="Si true, no escribe en BD"),
+):
+    """
+    Rellena EAN para productos con ean IS NULL consultando Daterium por nombre (fallback a daterium_id).
+    Siempre devuelve JSON. No revienta en 500: captura errores y los reporta.
+    """
+    _check_token(token)
+
+    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    if not user_id:
+        return {"ok": False, "error": "Falta DATERIUM_USER_ID en entorno"}
+
+    stats = {
+        "requested_limit": limit,
+        "processed": 0,
+        "updated": 0,
+        "skipped_no_match": 0,
+        "skipped_no_xml": 0,
+        "errors": 0,
+        "dry": bool(dry),
+        "pause_ms": pause_ms,
+        "samples": [],  # ejemplos de resultados por depuración
+    }
+
+    try:
+        dsn_val = _dsn()
+    except Exception as e:
+        return {"ok": False, "error": f"_dsn() error: {e}"}
+
+    try:
+        with psycopg.connect(dsn_val, autocommit=not dry) as conn, conn.cursor() as cur:
+            # Selecciona candidatos sin EAN, prioriza con datos útiles primero
+            cur.execute("""
+                SELECT id, daterium_id, name
+                FROM products
+                WHERE ean IS NULL AND (name IS NOT NULL OR daterium_id IS NOT NULL)
+                ORDER BY id DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+
+            for (pid, did, name) in rows:
+                stats["processed"] += 1
+                try:
+                    # 1) consulta por nombre (mejor recall)
+                    xml_bytes = None
+                    if name and len(name.strip()) >= 3:
+                        try:
+                            xml_bytes = _daterium_fetch_xml(user_id, name.strip())
+                        except Exception:
+                            xml_bytes = None
+
+                    # 2) si no hay EAN por nombre, intenta por daterium_id
+                    ean = None
+                    if xml_bytes:
+                        ean = _extract_first_ean_from_xml(xml_bytes)
+                    if not ean and did:
+                        try:
+                            xml_bytes = _daterium_fetch_xml(user_id, str(did))
+                            ean = _extract_first_ean_from_xml(xml_bytes)
+                        except Exception:
+                            xml_bytes = None
+
+                    if not xml_bytes:
+                        stats["skipped_no_xml"] += 1
+                        stats["samples"].append({"id": pid, "did": did, "name": name, "result": "no_xml"})
+                    elif not ean:
+                        stats["skipped_no_match"] += 1
+                        stats["samples"].append({"id": pid, "did": did, "name": name, "result": "no_ean"})
+                    else:
+                        if not dry:
+                            cur.execute("UPDATE products SET ean = %s WHERE id = %s", (ean, pid))
+                        stats["updated"] += 1
+                        stats["samples"].append({"id": pid, "did": did, "name": name, "result": "updated", "ean": ean})
+
+                    if pause_ms > 0:
+                        sleep(pause_ms / 1000.0)
+
+                except Exception as item_err:
+                    stats["errors"] += 1
+                    stats["samples"].append({"id": pid, "did": did, "name": name, "result": "error", "error": str(item_err)})
+
+            # En modo “dry” no hay commit; si se quisiera revertir en modo transacción, lo haríamos aquí.
+        return {"ok": True, "stats": stats}
+    except Exception as e:
+        # NUNCA devolvemos texto plano: siempre JSON
+        import traceback
+        return {
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc().splitlines(),
+            "stats": stats
+        }
