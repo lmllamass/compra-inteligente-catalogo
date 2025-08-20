@@ -611,3 +611,112 @@ def backfill_ean(
         conn.commit()
 
     return {"ok": True, "updated": done, "limit": limit}
+# --- Backfill EAN en tandas desde la API ---
+from fastapi import Body
+
+def _http() -> httpx.Client:
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=6.0, read=40.0, write=10.0, pool=10.0),
+        headers={"User-Agent": "CompraInteligente/1.0", "Accept": "application/xml"},
+    )
+
+def _normalize_ean(txt: str | None) -> str | None:
+    if not txt: return None
+    digits = re.sub(r"[^\d]", "", txt)
+    return digits if len(digits) in (8, 12, 13, 14) else None
+
+def _prefer_ean(eans: list[str]) -> str | None:
+    if not eans: return None
+    for L in (13, 14, 12, 8):
+        cand = [x for x in eans if len(x) == L]
+        if cand: return cand[0]
+    return eans[0]
+
+def _extract_eans(xml_bytes: bytes) -> list[str]:
+    root = etree.fromstring(xml_bytes)
+    out: list[str] = []
+    for e in root.xpath(".//referencias/referencia/ean"):
+        v = _normalize_ean((e.text or "").strip())
+        if v and v not in out: out.append(v)
+    if not out:
+        for e in root.xpath(".//ean"):
+            v = _normalize_ean((e.text or "").strip())
+            if v and v not in out: out.append(v)
+    return out
+
+@router.post("/backfill_ean_batch")
+def backfill_ean_batch(
+    token: str = Query(..., description="Security token"),
+    limit: int = Query(500, ge=1, le=5000),
+    pause_ms: int = Query(150, ge=0, le=5000, description="Pausa entre llamadas"),
+    dry: bool = Query(False, description="Dry-run (no escribe)"),
+):
+    """
+    Rellena EAN para productos sin EAN en tandas.
+    - Busca 'limit' productos con ean IS NULL
+    - Para cada uno consulta Daterium por 'daterium_id'
+    - Si encuentra EAN válido, lo actualiza
+    """
+    _check_token(token)
+    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+
+    updated = 0
+    scanned = 0
+    tried = 0
+    errors = 0
+    details: list[dict] = []
+
+    with psycopg.connect(_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        # lote de candidatos
+        cur.execute(
+            "SELECT id, daterium_id FROM products WHERE ean IS NULL AND daterium_id IS NOT NULL ORDER BY id ASC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            return {"ok": True, "done": True, "message": "No hay más productos sin EAN."}
+
+        with _http() as c:
+            for pid, did in rows:
+                scanned += 1
+                try:
+                    url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(str(did))}"
+                    r = c.get(url)
+                    tried += 1
+                    if r.status_code != 200 or not r.content:
+                        details.append({"id": pid, "did": did, "status": "no-content"})
+                    else:
+                        eans = _extract_eans(r.content)
+                        final = _prefer_ean(eans)
+                        if final and not dry:
+                            cur.execute("UPDATE products SET ean=%s WHERE id=%s", (final, pid))
+                            updated += 1
+                            details.append({"id": pid, "did": did, "ean": final, "status": "updated"})
+                        else:
+                            details.append({"id": pid, "did": did, "status": "no-ean"})
+                except Exception as e:
+                    errors += 1
+                    details.append({"id": pid, "did": did, "error": str(e)})
+                if pause_ms > 0:
+                    time.sleep(pause_ms / 1000.0)
+
+        if dry:
+            conn.rollback()
+        else:
+            conn.commit()
+
+    # devolvemos resumen (capamos details a 50 para evitar payloads enormes)
+    return {
+        "ok": True,
+        "dry": dry,
+        "limit": limit,
+        "scanned": scanned,
+        "tried": tried,
+        "updated": updated,
+        "errors": errors,
+        "details": details[:50],
+        "more": scanned == limit  # si true, probablemente quedan más por procesar
+    }
