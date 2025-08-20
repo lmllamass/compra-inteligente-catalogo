@@ -837,3 +837,173 @@ def backfill_ean_batch(
             "trace": traceback.format_exc().splitlines(),
             "stats": stats
         }
+    # --- al inicio del archivo (si no lo tienes ya) ---
+import logging, time, traceback
+logger = logging.getLogger("admin")
+logger.setLevel(logging.INFO)
+
+# utilidades mínimas usadas por backfill
+def _sleep_ms(ms: int):
+    try:
+        time.sleep(max(0, int(ms)) / 1000.0)
+    except Exception:
+        time.sleep(0)
+
+def _fetch_xml(url: str):
+    import httpx
+    with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=45.0)) as c:
+        r = c.get(url, headers={"Accept": "application/xml"})
+        return r.status_code, r.content
+
+# =============== BACKFILL EAN ===============
+
+@router.post("/backfill_ean")
+def backfill_ean(
+    token: str = Query(...),
+    id: int = Query(..., description="ID interno de products"),
+    dry: bool = Query(False),
+):
+    """Rellena EAN para un product.id concreto (útil para pruebas)."""
+    _check_token(token)
+
+    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+
+    try:
+        with psycopg.connect(_dsn(), autocommit=not dry) as conn, conn.cursor() as cur:
+            # obtener producto
+            cur.execute("SELECT id, daterium_id, ean FROM products WHERE id = %s", (id,))
+            row = cur.fetchone()
+            if not row:
+                return {"ok": False, "reason": "not_found"}
+
+            pid, daterium_id, current_ean = row
+            if current_ean:
+                return {"ok": True, "skipped": True, "reason": "already_has_ean", "id": pid}
+
+            # buscar por nombre si no hay daterium_id
+            cur.execute("SELECT name FROM products WHERE id = %s", (pid,))
+            name = cur.fetchone()[0]
+
+            # construye URL de Daterium
+            from urllib.parse import quote
+            q = str(daterium_id or name or "").strip()
+            if not q:
+                return {"ok": False, "reason": "no_query_for_daterium", "id": pid}
+
+            url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(q)}"
+            status, content = _fetch_xml(url)
+            if status != 200:
+                return {"ok": False, "reason": "daterium_http", "status": status, "id": pid}
+
+            # parse XML y extraer EAN
+            from lxml import etree
+            root = etree.fromstring(content)
+            ficha = root.find(".//ficha")
+            if ficha is None:
+                return {"ok": False, "reason": "no_ficha", "id": pid}
+
+            ref = ficha.find(".//referencias/referencia")
+            if ref is None:
+                return {"ok": False, "reason": "no_referencia", "id": pid}
+
+            ean = (ref.findtext("ean") or "").strip() or None
+            if not ean:
+                return {"ok": False, "reason": "ean_not_found", "id": pid}
+
+            if dry:
+                return {"ok": True, "dry": True, "id": pid, "ean": ean}
+
+            cur.execute("UPDATE products SET ean = %s WHERE id = %s", (ean, pid))
+            return {"ok": True, "updated": 1, "id": pid, "ean": ean}
+
+    except Exception as e:
+        logger.exception("backfill_ean failed")
+        # devolvemos JSON en lugar de texto plano
+        raise HTTPException(status_code=500, detail=f"backfill_ean failed: {e}")
+
+
+@router.post("/backfill_ean_batch")
+def backfill_ean_batch(
+    token: str = Query(...),
+    limit: int = Query(25, ge=1, le=1000),
+    pause_ms: int = Query(150, ge=0, le=5000),
+    dry: bool = Query(False),
+):
+    """
+    Procesa en bloque productos sin EAN.
+    Devuelve listado de resultados por cada id procesado.
+    """
+    _check_token(token)
+
+    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+
+    out = {"ok": True, "processed": []}
+    try:
+        with psycopg.connect(_dsn(), autocommit=not dry) as conn, conn.cursor() as cur:
+            # selecciona candidatos
+            cur.execute("""
+                SELECT id, daterium_id, name
+                FROM products
+                WHERE ean IS NULL
+                ORDER BY id ASC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+
+            from urllib.parse import quote
+            from lxml import etree
+
+            for (pid, daterium_id, name) in rows:
+                result: dict = {"id": pid}
+                try:
+                    q = str(daterium_id or name or "").strip()
+                    if not q:
+                        result.update({"ok": False, "reason": "no_query"})
+                        out["processed"].append(result); continue
+
+                    url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(q)}"
+                    status, content = _fetch_xml(url)
+                    if status != 200:
+                        result.update({"ok": False, "reason": "daterium_http", "status": status})
+                        out["processed"].append(result); _sleep_ms(pause_ms); continue
+
+                    root = etree.fromstring(content)
+                    ficha = root.find(".//ficha")
+                    if ficha is None:
+                        result.update({"ok": False, "reason": "no_ficha"})
+                        out["processed"].append(result); _sleep_ms(pause_ms); continue
+
+                    ref = ficha.find(".//referencias/referencia")
+                    if ref is None:
+                        result.update({"ok": False, "reason": "no_referencia"})
+                        out["processed"].append(result); _sleep_ms(pause_ms); continue
+
+                    ean = (ref.findtext("ean") or "").strip() or None
+                    if not ean:
+                        result.update({"ok": False, "reason": "ean_not_found"})
+                        out["processed"].append(result); _sleep_ms(pause_ms); continue
+
+                    if dry:
+                        result.update({"ok": True, "dry": True, "ean": ean})
+                    else:
+                        cur.execute("UPDATE products SET ean = %s WHERE id = %s", (ean, pid))
+                        result.update({"ok": True, "updated": 1, "ean": ean})
+
+                    out["processed"].append(result)
+                    _sleep_ms(pause_ms)
+
+                except Exception as inner:
+                    logger.exception("error per id in backfill_ean_batch")
+                    result.update({"ok": False, "reason": f"exception: {inner}"})
+                    out["processed"].append(result)
+                    _sleep_ms(pause_ms)
+
+        return out
+
+    except Exception as e:
+        logger.exception("backfill_ean_batch failed")
+        raise HTTPException(status_code=500, detail=f"backfill_ean_batch failed: {e}")
