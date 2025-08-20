@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -15,7 +16,9 @@ from urllib.parse import quote
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
-# -------------------- helpers --------------------
+# ======================================================
+# Helpers conexión
+# ======================================================
 def _dsn() -> str:
     """
     Elige el DSN correcto y fija sslmode según el tipo de endpoint.
@@ -29,24 +32,19 @@ def _dsn() -> str:
         if not val:
             continue
 
-        # ¿Ya trae parámetros?
         sep = "&" if "?" in val else "?"
 
-        # Hostname para decidir SSL
         host = None
         try:
             host = re.search(r'@([^/:]+)', val).group(1)
         except Exception:
             pass
 
-        # Heurística: interno vs público
         is_private = False
         if host:
-            # dominios internos de Railway
             if ".railway.internal" in host:
                 is_private = True
-            # IPv6 ULA (fd00::/8)
-            if ":" in host and host.lower().startswith("fd"):
+            if ":" in host and host.lower().startswith("fd"):  # IPv6 ULA
                 is_private = True
 
         if is_private:
@@ -59,9 +57,10 @@ def _dsn() -> str:
         return val
 
     raise HTTPException(status_code=500, detail="No DATABASE_URL/PGDATABASE_URL/DATABASE_PUBLIC_URL set")
+
+
 def _connect():
     dsn = _dsn()
-    # keepalives y reintentos suaves
     from time import sleep
     last_err = None
     for _ in range(3):
@@ -75,10 +74,13 @@ def _connect():
             last_err = e
             sleep(1.0)
     raise HTTPException(status_code=500, detail=f"DB connect failed: {last_err}")
+
+
 def _check_token(token: Optional[str]):
     expected = os.getenv("MIGRATION_TOKEN", "")
     if not expected or token != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
 
 def _load_sql_file(rel_path: str) -> str:
     """
@@ -91,11 +93,13 @@ def _load_sql_file(rel_path: str) -> str:
     lines = sql_path.read_text(encoding="utf-8").splitlines()
     return "\n".join(l for l in lines if not l.strip().startswith("#"))
 
+
 def _http() -> httpx.Client:
     return httpx.Client(
         timeout=httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=5.0),
         headers={"User-Agent": "CompraInteligente/1.0", "Accept": "application/xml"},
     )
+
 
 def _parse_float(txt: Optional[str]) -> Optional[float]:
     if not txt:
@@ -105,12 +109,64 @@ def _parse_float(txt: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
-# -------------------- endpoints base --------------------
+# ======================================================
+# EAN helpers (robustos)
+# ======================================================
+_EAN_CAND_RE = re.compile(r"\b(\d{8}|\d{12,14})\b")  # EAN8 / GTIN-12/13/14
+
+def _gtin_checksum_ok(code: str) -> bool:
+    """Valida EAN/GTIN de 8/12/13/14 dígitos (checksum módulo 10)."""
+    n = len(code)
+    if n not in (8, 12, 13, 14) or not code.isdigit():
+        return False
+    s = 0
+    for i, c in enumerate(reversed(code[:-1]), start=1):
+        w = 3 if i % 2 == 1 else 1
+        s += int(c) * w
+    check = (10 - (s % 10)) % 10
+    return check == int(code[-1])
+
+def _extract_eans_from_ficha(ficha) -> list[str]:
+    """Devuelve lista de EAN/GTIN candidatos de <referencias> y textos, validados y priorizados."""
+    eans: list[str] = []
+
+    # 1) explícitos en referencias
+    for ref in ficha.xpath(".//referencias/referencia"):
+        for tag in ("ean", "ean13", "gtin", "codigo_barras"):
+            val = (ref.findtext(tag) or "").strip()
+            if val and val.isdigit():
+                eans.append(val)
+        # dentro de textos libres tipo sku/codigo
+        for tag in ("sku", "codigo", "ref", "referencia"):
+            val = (ref.findtext(tag) or "").strip()
+            if val:
+                eans.extend(_EAN_CAND_RE.findall(val))
+
+    # 2) buscar en nombre/descripcion si hiciera falta
+    for tag in ("nombre", "descripcion", "descripcioncorta"):
+        txt = (ficha.findtext(tag) or "").strip()
+        if txt:
+            eans.extend(_EAN_CAND_RE.findall(txt))
+
+    # Normaliza, valida checksum y prioriza GTIN-13
+    uniq: list[str] = []
+    for e in eans:
+        e = e.strip()
+        if e not in uniq and _gtin_checksum_ok(e):
+            uniq.append(e)
+
+    uniq.sort(key=lambda x: (len(x) != 13, len(x)))  # primero 13 dígitos
+    return uniq
+
+# ======================================================
+# Endpoints base
+# ======================================================
 @router.get("/debug_token_status")
 def debug_token_status():
     """No expone el token. Solo indica si está presente y su longitud."""
     val = os.getenv("MIGRATION_TOKEN", "")
     return {"present": bool(val), "length": len(val)}
+
 
 @router.post("/migrate")
 def run_migration(token: str = Query(..., description="Security token")):
@@ -129,6 +185,7 @@ def run_migration(token: str = Query(..., description="Security token")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"migration failed: {e}")
 
+
 @router.get("/tables")
 def list_tables(token: str = Query(..., description="Security token")):
     _check_token(token)
@@ -145,6 +202,7 @@ def list_tables(token: str = Query(..., description="Security token")):
         return {"ok": True, "tables": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"list failed: {e}")
+
 
 @router.get("/count")
 def count_tables(token: str = Query(..., description="Security token")):
@@ -168,7 +226,9 @@ def count_tables(token: str = Query(..., description="Security token")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"count failed: {e}")
 
-# -------------------- semilla desde Daterium --------------------
+# ======================================================
+# Semilla desde Daterium (con EAN robusto)
+# ======================================================
 SEED_QUERIES: List[str] = [
     "tivoly", "broca", "punta", "atornillado", "anclaje",
     "disco", "llave", "sierra", "adhesivo", "tornillo", "tuerca", "arandela"
@@ -263,6 +323,7 @@ def seed_basic(
                 root = etree.fromstring(r.content)
 
                 for ficha in root.xpath(".//ficha"):
+                    # ids
                     id_txt = ficha.findtext("id")
                     idcat = ficha.get("idcatalogo")
                     daterium_id = None
@@ -289,26 +350,28 @@ def seed_basic(
                     img500 = (ficha.findtext("img500x500") or "").strip() or None
                     image_url = img500 or img280 or thumb
 
-                    ean = None
+                    # pvp: primero que venga
                     pvp = None
                     ref = ficha.find(".//referencias/referencia")
                     if ref is not None:
-                        ean = (ref.findtext("ean") or "").strip() or None
                         pvp = _parse_float(ref.findtext("pvp"))
 
-                    brand_id = _upsert_brand(cur, marca_name, logo_marca)
+                    # EAN robusto (validado y priorizado GTIN-13)
+                    ean_list = _extract_eans_from_ficha(ficha)
+                    ean = ean_list[0] if ean_list else None
 
+                    brand_id = _upsert_brand(cur, marca_name, logo_marca)
                     parent_id = _upsert_family(cur, familia_name, None) if familia_name else None
                     family_id = _upsert_family(cur, subfamilia_name, parent_id) if subfamilia_name else parent_id
 
-                    pid = _upsert_product(cur, daterium_id, nombre, descripcion, brand_id, family_id, ean, None, pvp, thumb, image_url)
+                    pid = _upsert_product(
+                        cur, daterium_id, nombre, descripcion, brand_id, family_id,
+                        ean, None, pvp, thumb, image_url
+                    )
 
-                    if thumb:
-                        _upsert_image(cur, pid, thumb, image_url == thumb)
-                    if img280:
-                        _upsert_image(cur, pid, img280, image_url == img280)
-                    if img500:
-                        _upsert_image(cur, pid, img500, image_url == img500)
+                    if thumb:  _upsert_image(cur, pid, thumb,  image_url == thumb)
+                    if img280: _upsert_image(cur, pid, img280, image_url == img280)
+                    if img500: _upsert_image(cur, pid, img500, image_url == img500)
 
                     total += 1
 
@@ -316,7 +379,9 @@ def seed_basic(
 
     return {"ok": True, "inserted_or_updated": total, "queries": q_list}
 
-# -------------------- monitorización de ingesta --------------------
+# ======================================================
+# Monitorización de ingesta
+# ======================================================
 @router.get("/ingest_stats")
 def ingest_stats(token: str = Query(..., description="Security token")):
     _check_token(token)
@@ -334,6 +399,7 @@ def ingest_stats(token: str = Query(..., description="Security token")):
             for r in rows
         ],
     }
+
 
 @router.get("/recent")
 def recent_products(
@@ -373,6 +439,7 @@ def recent_products(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"recent failed: {e}")
 
+
 @router.get("/ingest_log")
 def ingest_log(
     token: str = Query(..., description="Security token"),
@@ -393,12 +460,12 @@ def ingest_log(
                 for (ts, s, k, st, n) in cur.fetchall()]
     return {"ok": True, "rows": rows, "limit": limit}
 
+
 @router.get("/progress")
 def progress(token: str = Query(..., description="Security token")):
     _check_token(token)
     out: Dict[str, Any] = {"ok": True, "counts": {}, "latest": {}}
     with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
-        # counts
         for t in ("brands", "families", "products"):
             try:
                 cur.execute(f"SELECT COUNT(*) FROM {t}")
@@ -406,7 +473,6 @@ def progress(token: str = Query(..., description="Security token")):
             except Exception:
                 out["counts"][t] = None
 
-        # latest row in ingest_log
         cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
         if cur.fetchone()[0]:
             cur.execute("""
@@ -428,14 +494,13 @@ def progress(token: str = Query(..., description="Security token")):
         else:
             out["latest"] = {"info": "ingest_log no existe"}
     return out
-# --- DEBUG: ver entorno y conexión rápida ---
+
+
 @router.get("/debug_env")
 def debug_env(token: str = Query(...)):
     _check_token(token)
-    # NO devolvemos credenciales, solo presencia
     keys = ["DATABASE_URL", "PGDATABASE_URL", "DATABASE_PUBLIC_URL"]
     present = {k: bool(os.getenv(k)) for k in keys}
-    # además, mostramos cuál DSN usaría _dsn()
     dsn_status = "ok"
     dsn_val = None
     try:
@@ -443,6 +508,7 @@ def debug_env(token: str = Query(...)):
     except Exception as e:
         dsn_status = f"error: {e}"
     return {"ok": True, "present": present, "dsn_status": dsn_status, "using": dsn_val is not None}
+
 
 @router.get("/debug_sql")
 def debug_sql(token: str = Query(...)):
@@ -455,14 +521,13 @@ def debug_sql(token: str = Query(...)):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# --- versión más defensiva de /admin/progress con detalle de error ---
+
 @router.get("/progress_safe")
 def progress_safe(token: str = Query(...)):
     _check_token(token)
     out = {"ok": True, "counts": {}, "latest": {}, "errors": []}
     try:
         with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
-            # counts (cada tabla en try para no romper todo)
             for t in ("brands", "families", "products"):
                 try:
                     cur.execute(f"SELECT COUNT(*) FROM {t}")
@@ -471,7 +536,6 @@ def progress_safe(token: str = Query(...)):
                     out["counts"][t] = None
                     out["errors"].append(f"count {t}: {e}")
 
-            # latest ingest_log si existe
             try:
                 cur.execute("SELECT to_regclass('public.ingest_log') IS NOT NULL;")
                 if cur.fetchone()[0]:
@@ -496,3 +560,54 @@ def progress_safe(token: str = Query(...)):
         return {"ok": False, "fatal": str(e)}
 
     return out
+
+
+# ======================================================
+# Backfill EAN vía endpoint (opcional)
+# ======================================================
+@router.post("/backfill_ean")
+def backfill_ean(
+    token: str = Query(...),
+    limit: int = Query(500, ge=1, le=5000),
+    sleep: float = Query(0.2, ge=0, le=2.0)
+):
+    """
+    Completa EAN para productos sin EAN consultando Daterium por daterium_id.
+    """
+    _check_token(token)
+    user_id = os.getenv("DATERIUM_USER_ID","").strip()
+    if not user_id:
+        raise HTTPException(500, "Falta DATERIUM_USER_ID")
+
+    done = 0
+    import time
+    with psycopg.connect(_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT id, daterium_id FROM products
+            WHERE ean IS NULL AND daterium_id IS NOT NULL
+            ORDER BY id ASC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+
+        with _http() as c:
+            for pid, did in rows:
+                time.sleep(sleep)
+                url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(str(did))}"
+                r = c.get(url)
+                if r.status_code != 200:
+                    continue
+                root = etree.fromstring(r.content)
+                ficha = root.find(".//ficha")
+                if ficha is None:
+                    continue
+                eans = _extract_eans_from_ficha(ficha)
+                if not eans:
+                    continue
+                ean = eans[0]
+                cur.execute("UPDATE products SET ean = %s WHERE id = %s", (ean, pid))
+                done += 1
+
+        conn.commit()
+
+    return {"ok": True, "updated": done, "limit": limit}
