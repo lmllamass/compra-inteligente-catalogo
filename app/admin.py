@@ -720,3 +720,261 @@ def backfill_ean_batch(
         "details": details[:50],
         "more": scanned == limit  # si true, probablemente quedan más por procesar
     }
+# ===================== IMPORTACIÓN POR MARCA (mínima) =====================
+from typing import Optional, List, Dict, Any
+import re
+import time
+import unicodedata
+
+import httpx
+from lxml import etree
+from urllib.parse import quote
+
+# -- Helpers ya existentes que reutilizamos si están definidos:
+# _dsn(), _check_token(token), _upsert_brand(cur, name, logo_url)
+
+def _http_xml() -> httpx.Client:
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=5.0, read=45.0, write=10.0, pool=10.0),
+        headers={"User-Agent": "CompraInteligente/1.0", "Accept": "application/xml"},
+    )
+
+def clean_ean(raw: Optional[str]) -> Optional[str]:
+    """
+    Normaliza y valida EAN:
+    - Mantiene solo dígitos
+    - Si 13 dígitos: valida checksum (mód 10). Si ok, lo devuelve.
+    - Si 12 u 8: intenta calcular dígito de control y devolver EAN-13/8 válido.
+    - En otro caso: None
+    """
+    if not raw:
+        return None
+    s = re.sub(r"\D+", "", raw)
+    if len(s) == 13:
+        # validar checksum
+        digits = [int(c) for c in s]
+        check = digits[-1]
+        body = digits[:-1]
+        total = sum((d if i % 2 == 0 else d * 3) for i, d in enumerate(body))
+        calc = (10 - (total % 10)) % 10
+        return s if calc == check else None
+    if len(s) == 12:
+        digits = [int(c) for c in s]
+        total = sum((d if i % 2 == 0 else d * 3) for i, d in enumerate(digits))
+        check = (10 - (total % 10)) % 10
+        return s + str(check)
+    if len(s) == 8:
+        # EAN-8: validar/calc checksum
+        digits = [int(c) for c in s[:-1]]
+        check = int(s[-1])
+        total = (digits[0]*3 + digits[1]*1 + digits[2]*3 + digits[3]*1 +
+                 digits[4]*3 + digits[5]*1 + digits[6]*3)
+        calc = (10 - (total % 10)) % 10
+        return s if calc == check else None
+    return None
+
+def norm_text(txt: Optional[str]) -> Optional[str]:
+    if not txt:
+        return None
+    # Normaliza y quita rarezas de espacios
+    t = unicodedata.normalize("NFC", txt).strip()
+    return re.sub(r"\s+", " ", t)
+
+def fetch_daterium_by_query(user_id: str, query: str) -> List[Dict[str, Any]]:
+    """
+    Llama al endpoint XML de Daterium con el texto dado y devuelve
+    una lista de dicts con los campos mínimos.
+    """
+    url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(user_id)}&searchbox={quote(query)}"
+    out: List[Dict[str, Any]] = []
+    with _http_xml() as c:
+        r = c.get(url)
+        if r.status_code != 200:
+            return out
+        root = etree.fromstring(r.content)
+
+    for ficha in root.xpath(".//ficha"):
+        id_txt = ficha.findtext("id")
+        idcat  = ficha.get("idcatalogo")
+        daterium_id = None
+        for candidate in (id_txt, idcat):
+            if candidate and str(candidate).strip().isdigit():
+                daterium_id = int(str(candidate).strip())
+                break
+        if not daterium_id:
+            continue
+
+        nombre = norm_text(ficha.findtext("nombre") or "")
+        if not nombre:
+            continue
+
+        # imágenes mínimas
+        thumb = norm_text(ficha.findtext("thumb") or "")
+        img280 = norm_text(ficha.findtext("img280x240") or "")
+        img500 = norm_text(ficha.findtext("img500x500") or "")
+        image_url = img500 or img280 or thumb or None
+        thumb_url = thumb or img280 or None
+
+        # EAN
+        ean = None
+        ref = ficha.find(".//referencias/referencia")
+        if ref is not None:
+            ean = clean_ean(ref.findtext("ean"))
+
+        out.append({
+            "daterium_id": daterium_id,
+            "name": nombre,
+            "ean": ean,
+            "thumb_url": thumb_url,
+            "image_url": image_url,
+        })
+    return out
+
+def _brand_id_by_name(cur, brand_name: str) -> Optional[int]:
+    cur.execute("SELECT id FROM brands WHERE name = %s", (brand_name,))
+    row = cur.fetchone()
+    return row[0] if row else None
+
+def _delete_brand_products(cur, brand_id: int) -> int:
+    # Eliminar imágenes de los productos de esa marca
+    cur.execute("""
+        DELETE FROM product_images
+        WHERE product_id IN (SELECT id FROM products WHERE brand_id = %s)
+    """, (brand_id,))
+    # Eliminar productos
+    cur.execute("DELETE FROM products WHERE brand_id = %s RETURNING id", (brand_id,))
+    deleted = cur.rowcount or 0
+    return deleted
+
+@router.post("/import_brand")
+def import_brand(
+    token: str = Query(..., description="Security token"),
+    brand: str = Query(..., description="Nombre exacto de la marca (tal como está en DB o en Daterium)"),
+    pause_ms: int = Query(150, ge=0, le=5000, description="Pausa tras la petición a Daterium"),
+    dry: bool = Query(False, description="Si true, no escribe cambios"),
+):
+    """
+    Importa productos por *marca* desde Daterium:
+    - Busca/crea brand
+    - Borra todo lo existente de esa marca
+    - Inserta productos mínimos: daterium_id, name, ean, thumb_url, image_url, brand_id
+    """
+    _check_token(token)
+    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+
+    brand_name = norm_text(brand)
+    if not brand_name:
+        raise HTTPException(status_code=400, detail="brand vacío")
+
+    try:
+        with psycopg.connect(_dsn(), autocommit=False) as conn, conn.cursor() as cur:
+            # upsert brand con logo null (mínimo)
+            brand_id = _brand_id_by_name(cur, brand_name)
+            if not brand_id:
+                brand_id = _upsert_brand(cur, brand_name, None)
+
+            # descarga
+            items = fetch_daterium_by_query(user_id, brand_name)
+            if pause_ms:
+                time.sleep(pause_ms / 1000.0)
+
+            # borrar lo anterior
+            deleted = 0
+            if not dry:
+                deleted = _delete_brand_products(cur, brand_id)
+
+            inserted = 0
+            for it in items:
+                did = it["daterium_id"]
+                name = it["name"]
+                ean = it["ean"]
+                thumb = it["thumb_url"]
+                image = it["image_url"]
+
+                sql = """
+                INSERT INTO products(daterium_id, name, brand_id, ean, thumb_url, image_url)
+                VALUES (%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (daterium_id) DO UPDATE
+                  SET name = EXCLUDED.name,
+                      brand_id = EXCLUDED.brand_id,
+                      ean = COALESCE(EXCLUDED.ean, products.ean),
+                      thumb_url = COALESCE(EXCLUDED.thumb_url, products.thumb_url),
+                      image_url = COALESCE(EXCLUDED.image_url, products.image_url)
+                RETURNING id
+                """
+                if not dry:
+                    cur.execute(sql, (did, name, brand_id, ean, thumb, image))
+                inserted += 1
+
+            if dry:
+                conn.rollback()
+            else:
+                conn.commit()
+
+        return {
+            "ok": True,
+            "brand": brand_name,
+            "brand_id": brand_id,
+            "deleted_prev": deleted if not dry else 0,
+            "fetched": len(items),
+            "inserted_or_updated": inserted,
+            "dry": dry,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"import_brand failed: {e}")
+
+@router.post("/import_all_brands")
+def import_all_brands(
+    token: str = Query(...),
+    batch: int = Query(5, ge=1, le=100),
+    pause_ms: int = Query(300, ge=0, le=5000),
+    dry: bool = Query(False),
+):
+    """
+    Recorre todas las marcas de la tabla brands y llama a importación por cada una.
+    Útil cuando ya tienes brands pobladas (de tu semilla).
+    """
+    _check_token(token)
+    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+
+    brands: List[str] = []
+    with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT name FROM brands ORDER BY id ASC")
+        brands = [r[0] for r in cur.fetchall()]
+
+    results = []
+    processed = 0
+    for name in brands:
+        r = import_brand(token=token, brand=name, pause_ms=pause_ms, dry=dry)  # reutilizamos endpoint
+        results.append({"brand": name, "fetched": r["fetched"], "inserted_or_updated": r["inserted_or_updated"]})
+        processed += 1
+        if processed % batch == 0 and pause_ms:
+            time.sleep(pause_ms / 1000.0)
+
+    return {"ok": True, "count_brands": len(brands), "results": results, "dry": dry}
+
+@router.get("/brand_status")
+def brand_status(
+    token: str = Query(...),
+    brand: str = Query(..., description="Nombre exacto de marca"),
+):
+    _check_token(token)
+    brand_name = norm_text(brand)
+    if not brand_name:
+        raise HTTPException(status_code=400, detail="brand vacío")
+
+    with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM brands WHERE name = %s", (brand_name,))
+        row = cur.fetchone()
+        if not row:
+            return {"ok": True, "brand": brand_name, "exists": False}
+        bid = row[0]
+        cur.execute("SELECT COUNT(*) FROM products WHERE brand_id = %s", (bid,))
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM products WHERE brand_id = %s AND ean IS NOT NULL", (bid,))
+        with_ean = cur.fetchone()[0]
+        return {"ok": True, "brand": brand_name, "exists": True, "products": total, "with_ean": with_ean}
