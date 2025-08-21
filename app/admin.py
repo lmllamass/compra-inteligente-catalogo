@@ -5,6 +5,8 @@ import os
 import re
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+import time
+import unicodedata
 
 import psycopg
 from fastapi import APIRouter, HTTPException, Query
@@ -612,13 +614,6 @@ def backfill_ean(
 
     return {"ok": True, "updated": done, "limit": limit}
 # --- Backfill EAN en tandas desde la API ---
-from fastapi import Body
-
-def _http() -> httpx.Client:
-    return httpx.Client(
-        timeout=httpx.Timeout(connect=6.0, read=40.0, write=10.0, pool=10.0),
-        headers={"User-Agent": "CompraInteligente/1.0", "Accept": "application/xml"},
-    )
 
 def _normalize_ean(txt: str | None) -> str | None:
     if not txt: return None
@@ -721,14 +716,7 @@ def backfill_ean_batch(
         "more": scanned == limit  # si true, probablemente quedan más por procesar
     }
 # ===================== IMPORTACIÓN POR MARCA (mínima) =====================
-from typing import Optional, List, Dict, Any
-import re
-import time
-import unicodedata
 
-import httpx
-from lxml import etree
-from urllib.parse import quote
 
 # -- Helpers ya existentes que reutilizamos si están definidos:
 # _dsn(), _check_token(token), _upsert_brand(cur, name, logo_url)
