@@ -803,11 +803,14 @@ def fetch_daterium_by_query(user_id: str, query: str) -> List[Dict[str, Any]]:
         image_url = img500 or img280 or thumb or None
         thumb_url = thumb or img280 or None
 
-        # EAN
+        # EAN (robusto, prioriza GTIN-13 y valida checksum)
         ean = None
-        ref = ficha.find(".//referencias/referencia")
-        if ref is not None:
-            ean = clean_ean(ref.findtext("ean"))
+        try:
+            eans = _extract_eans_from_ficha(ficha)
+            if eans:
+                ean = eans[0]
+        except Exception:
+            ean = None
 
         out.append({
             "daterium_id": daterium_id,
@@ -819,7 +822,7 @@ def fetch_daterium_by_query(user_id: str, query: str) -> List[Dict[str, Any]]:
     return out
 
 def _brand_id_by_name(cur, brand_name: str) -> Optional[int]:
-    cur.execute("SELECT id FROM brands WHERE name = %s", (brand_name,))
+    cur.execute("SELECT id FROM brands WHERE LOWER(name) = LOWER(%s)", (brand_name,))
     row = cur.fetchone()
     return row[0] if row else None
 
@@ -878,6 +881,7 @@ def import_brand(
                 did = it["daterium_id"]
                 name = it["name"]
                 ean = it["ean"]
+                ean = clean_ean(ean)
                 thumb = it["thumb_url"]
                 image = it["image_url"]
 
@@ -966,3 +970,12 @@ def brand_status(
         cur.execute("SELECT COUNT(*) FROM products WHERE brand_id = %s AND ean IS NOT NULL", (bid,))
         with_ean = cur.fetchone()[0]
         return {"ok": True, "brand": brand_name, "exists": True, "products": total, "with_ean": with_ean}
+
+# --- Brand list endpoint ---
+@router.get("/brand_list")
+def brand_list(token: str = Query(...)):
+    _check_token(token)
+    with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
+        cur.execute("SELECT name FROM brands ORDER BY name ASC")
+        rows = [r[0] for r in cur.fetchall()]
+    return {"ok": True, "brands": rows, "count": len(rows)}
