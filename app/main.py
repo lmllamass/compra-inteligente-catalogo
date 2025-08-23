@@ -1,16 +1,11 @@
 import os
-import httpx
-from lxml import etree
-from urllib.parse import quote
 from fastapi import FastAPI
 
 app = FastAPI(
     title="Ferretero API",
-    description="API para catalogo de herramientas",
+    description="API para catalogo de herramientas", 
     version="1.0.0"
 )
-
-DATERIUM_USER_ID = "0662759feb731be6fd95c59c4bad9f5209286336"
 
 @app.get("/")
 async def root():
@@ -27,10 +22,15 @@ async def health():
 @app.get("/test_daterium/{marca}")
 async def test_daterium(marca: str):
     """Test de parseo de productos de Daterium"""
-    url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(DATERIUM_USER_ID)}&searchbox={quote(marca)}"
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
+    try:
+        import httpx
+        from lxml import etree
+        from urllib.parse import quote
+        
+        DATERIUM_USER_ID = "0662759feb731be6fd95c59c4bad9f5209286336"
+        url = f"https://api.dateriumsystem.com/busqueda_avanzada_fc_xml.php?userID={quote(DATERIUM_USER_ID)}&searchbox={quote(marca)}"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
             if response.status_code != 200:
                 return {"error": f"HTTP {response.status_code}", "url": url}
@@ -39,7 +39,7 @@ async def test_daterium(marca: str):
             root = etree.fromstring(response.content)
             productos = []
             
-            for ficha in root.xpath('.//ficha'):
+            for ficha in root.xpath('.//ficha')[:3]:  # Solo 3 para test
                 try:
                     producto = {
                         "id": ficha.findtext('id'),
@@ -48,20 +48,20 @@ async def test_daterium(marca: str):
                         "familia": ficha.findtext('familia'),
                         "subfamilia": ficha.findtext('subfamilia'),
                         "proveedor": ficha.findtext('proveedor'),
-                        "relevancia": ficha.get('relevancia'),
-                        "thumb": ficha.findtext('thumb'),
-                        "img500": ficha.findtext('img500x500')
+                        "relevancia": ficha.get('relevancia')
                     }
                     productos.append(producto)
                 except Exception as e:
-                    productos.append({"error": str(e)})
+                    productos.append({"parse_error": str(e)})
             
             return {
                 "marca_buscada": marca,
                 "total_encontrados": len(productos),
-                "productos": productos[:5],  # Solo primeros 5 para test
+                "productos": productos,
                 "xml_size": len(response.content)
             }
             
-        except Exception as e:
-            return {"error": str(e), "url": url}
+    except ImportError as e:
+        return {"error": f"Import failed: {e}"}
+    except Exception as e:
+        return {"error": f"General error: {e}", "type": type(e).__name__}
