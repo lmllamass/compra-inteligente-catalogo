@@ -1,0 +1,99 @@
+>> 2025-08-19 11:06:41 Seed: tornillo,tuerca,arandela,anclaje,taco%20quimico (intento 1)
+Internal Server Error
+>> 2025-08-19 11:07:56 Seed: tornillo,tuerca,arandela,anclaje,taco%20quimico (intento 2)
+Internal Server Error
+>> 2025-08-19 11:08:02 Seed: tornillo,tuerca,arandela,anclaje,taco%20quimico (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: tornillo,tuerca,arandela,anclaje,taco%20quimico
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:08:22 Seed: broca,metrica,roscadora,extractor%20de%20tornillos (intento 1)
+Internal Server Error
+>> 2025-08-19 11:08:27 Seed: broca,metrica,roscadora,extractor%20de%20tornillos (intento 2)
+Internal Server Error
+>> 2025-08-19 11:08:33 Seed: broca,metrica,roscadora,extractor%20de%20tornillos (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: broca,metrica,roscadora,extractor%20de%20tornillos
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:08:53 Seed: disco%20corte,disco%20desbaste,corona%20circular (intento 1)
+Internal Server Error
+>> 2025-08-19 11:09:34 Seed: disco%20corte,disco%20desbaste,corona%20circular (intento 2)
+Internal Server Error
+>> 2025-08-19 11:09:39 Seed: disco%20corte,disco%20desbaste,corona%20circular (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: disco%20corte,disco%20desbaste,corona%20circular
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:10:00 Seed: atornillado,puntas%20atornillar,portapuntas,vasos,llave%20fija,llave%20mixta,llave%20inglesa,alicate (intento 1)
+Internal Server Error
+>> 2025-08-19 11:10:05 Seed: atornillado,puntas%20atornillar,portapuntas,vasos,llave%20fija,llave%20mixta,llave%20inglesa,alicate (intento 2)
+Internal Server Error
+>> 2025-08-19 11:10:11 Seed: atornillado,puntas%20atornillar,portapuntas,vasos,llave%20fija,llave%20mixta,llave%20inglesa,alicate (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: atornillado,puntas%20atornillar,portapuntas,vasos,llave%20fija,llave%20mixta,llave%20inglesa,alicate
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:10:32 Seed: destornillador,martillo,mazo,formon,cincel (intento 1)
+Internal Server Error
+>> 2025-08-19 11:12:47 Seed: destornillador,martillo,mazo,formon,cincel (intento 2)
+Internal Server Error
+>> 2025-08-19 11:15:03 Seed: destornillador,martillo,mazo,formon,cincel (intento 3)
+{
+  "status": "error",
+  "code": 502,
+  "message": "Application failed to respond",
+  "request_id": "_2VZO3GeQfO37NCOm3z_FQ"
+}
+!! Falló tras 3 intentos: destornillador,martillo,mazo,formon,cincel
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:15:34 Seed: adhesivo,epoxi,poliuretano,silicona,sellador (intento 1)
+Internal Server Error
+>> 2025-08-19 11:16:49 Seed: adhesivo,epoxi,poliuretano,silicona,sellador (intento 2)
+Internal Server Error
+>> 2025-08-19 11:16:55 Seed: adhesivo,epoxi,poliuretano,silicona,sellador (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: adhesivo,epoxi,poliuretano,silicona,sellador
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:17:15 Seed: fijatornillos,aflojatodo,desengrasante,limpiador%20industrial (intento 1)
+Internal Server Error
+>> 2025-08-19 11:19:31 Seed: fijatornillos,aflojatodo,desengrasante,limpiador%20industrial (intento 2)
+Internal Server Error
+>> 2025-08-19 11:21:47 Seed: fijatornillos,aflojatodo,desengrasante,limpiador%20industrial (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: fijatornillos,aflojatodo,desengrasante,limpiador%20industrial
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:24:17 Seed: brida,terminal,clema,conector%20rapido,canaleta (intento 1)
+Internal Server Error
+>> 2025-08-19 11:26:32 Seed: brida,terminal,clema,conector%20rapido,canaleta (intento 2)
+Internal Server Error
+>> 2025-08-19 11:28:48 Seed: brida,terminal,clema,conector%20rapido,canaleta (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: brida,terminal,clema,conector%20rapido,canaleta
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:31:18 Seed: guante%20nitrilo,mascara%20soldadura,gafa%20seguridad,casco%20obra,proteccion%20auditiva (intento 1)
+Internal Server Error
+>> 2025-08-19 11:33:33 Seed: guante%20nitrilo,mascara%20soldadura,gafa%20seguridad,casco%20obra,proteccion%20auditiva (intento 2)
+Internal Server Error
+>> 2025-08-19 11:35:49 Seed: guante%20nitrilo,mascara%20soldadura,gafa%20seguridad,casco%20obra,proteccion%20auditiva (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: guante%20nitrilo,mascara%20soldadura,gafa%20seguridad,casco%20obra,proteccion%20auditiva
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:38:19 Seed: manguito,rapido%20neumatico,teflon,abrazadera,grifo%20bola (intento 1)
+Internal Server Error
+>> 2025-08-19 11:40:35 Seed: manguito,rapido%20neumatico,teflon,abrazadera,grifo%20bola (intento 2)
+Internal Server Error
+>> 2025-08-19 11:42:50 Seed: manguito,rapido%20neumatico,teflon,abrazadera,grifo%20bola (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: manguito,rapido%20neumatico,teflon,abrazadera,grifo%20bola
+!! Lote con errores, sigo con el siguiente…
+>> 2025-08-19 11:45:21 Seed: andamio,borriqueta,puntal,regla%20obra,cutter (intento 1)
+Internal Server Error
+>> 2025-08-19 11:47:36 Seed: andamio,borriqueta,puntal,regla%20obra,cutter (intento 2)
+Internal Server Error
+>> 2025-08-19 11:49:52 Seed: andamio,borriqueta,puntal,regla%20obra,cutter (intento 3)
+Internal Server Error
+!! Falló tras 3 intentos: andamio,borriqueta,puntal,regla%20obra,cutter
+!! Lote con errores, sigo con el siguiente…
+== COMPLETADO ==
+-- PROGRESS --
+{
+  "detail": "count failed: connection failed: connection to server at \"fd12:3c44:9b09:0:1000:f:71a8:597c\", port 5432 failed: server closed the connection unexpectedly\n\tThis probably means the server terminated abnormally\n\tbefore or while processing the request."
+}
+
