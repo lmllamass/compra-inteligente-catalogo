@@ -1,13 +1,2 @@
-fastapi
-uvicorn
-SQLAlchemy
-psycopg2-binary
-httpx
-python-dotenv
-pydantic
-xmltodict
-httpx>=0.27.0
-lxml>=4.9.0
-redis>=5.0.0
-psycopg[binary]>=3.1.18
-psycopg[binary]
+fastapi==0.104.1
+uvicorn==0.24.0
