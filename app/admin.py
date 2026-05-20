@@ -11,10 +11,11 @@ import unicodedata
 import psycopg
 from fastapi import APIRouter, HTTPException, Query
 
-# Opcionales para semilla desde Daterium
 import httpx
 from lxml import etree
 from urllib.parse import quote
+
+from .settings import settings
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -308,9 +309,9 @@ def seed_basic(
     - queries (opcional): 'tivoly,broca,disco'
     """
     _check_token(token)
-    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    user_id = settings.DATERIUM_USERID
     if not user_id:
-        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USERID en variables de entorno")
 
     q_list = [q.strip() for q in (queries.split(",") if queries else SEED_QUERIES) if q.strip()]
     total = 0
@@ -577,9 +578,9 @@ def backfill_ean(
     Completa EAN para productos sin EAN consultando Daterium por daterium_id.
     """
     _check_token(token)
-    user_id = os.getenv("DATERIUM_USER_ID","").strip()
+    user_id = settings.DATERIUM_USERID
     if not user_id:
-        raise HTTPException(500, "Falta DATERIUM_USER_ID")
+        raise HTTPException(500, "Falta DATERIUM_USERID en variables de entorno")
 
     done = 0
     import time
@@ -653,9 +654,9 @@ def backfill_ean_batch(
     - Si encuentra EAN válido, lo actualiza
     """
     _check_token(token)
-    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    user_id = settings.DATERIUM_USERID
     if not user_id:
-        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USERID en variables de entorno")
 
     updated = 0
     scanned = 0
@@ -851,9 +852,9 @@ def import_brand(
     - Inserta productos mínimos: daterium_id, name, ean, thumb_url, image_url, brand_id
     """
     _check_token(token)
-    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    user_id = settings.DATERIUM_USERID
     if not user_id:
-        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USERID en variables de entorno")
 
     brand_name = norm_text(brand)
     if not brand_name:
@@ -929,9 +930,9 @@ def import_all_brands(
     Útil cuando ya tienes brands pobladas (de tu semilla).
     """
     _check_token(token)
-    user_id = os.getenv("DATERIUM_USER_ID", "").strip()
+    user_id = settings.DATERIUM_USERID
     if not user_id:
-        raise HTTPException(status_code=500, detail="Falta DATERIUM_USER_ID")
+        raise HTTPException(status_code=500, detail="Falta DATERIUM_USERID en variables de entorno")
 
     brands: List[str] = []
     with psycopg.connect(_dsn()) as conn, conn.cursor() as cur:
